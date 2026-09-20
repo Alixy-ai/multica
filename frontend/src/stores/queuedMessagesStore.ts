@@ -6,25 +6,38 @@
  * local `useRef` and was explicitly cleared on conversation switch, so
  * switching groups and back silently destroyed the user's queued text. The
  * queue is per-conversation state, not per-component state: it belongs in a
- * module-level store keyed by the conversation's state id (thread id when
- * present, else the conversation id) and survives navigation.
+ * module-level store keyed by the full send target and survives navigation.
  */
 
 import { create } from 'zustand'
 
 import type { MessageSendInput } from '@/types/api'
 
+export function queuedMessagesKey(
+  scope: 'groups' | 'direct-chats',
+  conversationId: string,
+  threadId?: string,
+): string {
+  // Note: a retained thread id must never let a different conversation claim
+  // its queue during navigation. Include the destination, not just UI state.
+  return JSON.stringify([scope, conversationId, threadId ?? null])
+}
+
+interface QueueDispatch {
+  input: MessageSendInput
+}
+
 interface QueuedMessagesState {
   /** Queued inputs per conversation state key, insertion-ordered. */
   byStateId: Record<string, MessageSendInput[]>
   /** Guards one queue release against StrictMode's repeated effect setup. */
-  dispatchingByStateId: Record<string, boolean>
+  dispatchingByStateId: Record<string, QueueDispatch>
 
   enqueue: (stateId: string, input: MessageSendInput[]) => void
   /** Reserve and remove the first queued input, if no release is in flight. */
-  beginDispatch: (stateId: string) => MessageSendInput | undefined
+  beginDispatch: (stateId: string) => QueueDispatch | undefined
   /** Finish a release, optionally returning a failed input to the queue front. */
-  finishDispatch: (stateId: string, retry?: MessageSendInput) => void
+  finishDispatch: (stateId: string, dispatch: QueueDispatch, retry?: boolean) => void
   clear: (stateId: string) => void
   clearAll: () => void
 }
@@ -47,6 +60,7 @@ export const useQueuedMessagesStore = create<QueuedMessagesState>((set, get) => 
     const current = state.byStateId[stateId] ?? []
     if (current.length === 0) return undefined
     const [next, ...rest] = current
+    const dispatch = { input: next }
     set((currentState) => {
       const byStateId = { ...currentState.byStateId }
       if (rest.length === 0) delete byStateId[stateId]
@@ -55,19 +69,18 @@ export const useQueuedMessagesStore = create<QueuedMessagesState>((set, get) => 
         byStateId,
         dispatchingByStateId: {
           ...currentState.dispatchingByStateId,
-          [stateId]: true,
+          [stateId]: dispatch,
         },
       }
     })
-    return next
+    return dispatch
   },
 
-  finishDispatch: (stateId, retry) =>
+  finishDispatch: (stateId, dispatch, retry) =>
     set((state) => {
-      // `clearAll` (logout / cross-window auth change) invalidates every
-      // in-flight release. A stale rejection must not resurrect the previous
-      // account's private message after its queue has been cleared.
-      if (!state.dispatchingByStateId[stateId]) return {}
+      // Note: clear/stop/logout invalidate the release, even if a new send has
+      // started under the same key. Old callbacks cannot restore or unlock it.
+      if (state.dispatchingByStateId[stateId] !== dispatch) return {}
       const dispatchingByStateId = { ...state.dispatchingByStateId }
       delete dispatchingByStateId[stateId]
       if (!retry) return { dispatchingByStateId }
@@ -75,17 +88,19 @@ export const useQueuedMessagesStore = create<QueuedMessagesState>((set, get) => 
         dispatchingByStateId,
         byStateId: {
           ...state.byStateId,
-          [stateId]: [retry, ...(state.byStateId[stateId] ?? [])],
+          [stateId]: [dispatch.input, ...(state.byStateId[stateId] ?? [])],
         },
       }
     }),
 
   clear: (stateId) =>
     set((state) => {
-      if (!(stateId in state.byStateId)) return {}
+      if (!(stateId in state.byStateId) && !(stateId in state.dispatchingByStateId)) return {}
       const next = { ...state.byStateId }
+      const dispatchingByStateId = { ...state.dispatchingByStateId }
       delete next[stateId]
-      return { byStateId: next }
+      delete dispatchingByStateId[stateId]
+      return { byStateId: next, dispatchingByStateId }
     }),
 
   clearAll: () => set({ byStateId: {}, dispatchingByStateId: {} }),

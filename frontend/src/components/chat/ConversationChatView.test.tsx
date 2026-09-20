@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { useState } from 'react'
 import userEvent from '@testing-library/user-event'
 import { I18nextProvider } from 'react-i18next'
@@ -60,6 +60,7 @@ vi.mock('@/components/chat/Composer', () => ({
           }}
         />
         <textarea aria-label="Message draft" />
+        <button onClick={props.onCancel}>Stop reply</button>
         <select aria-label="Message mode"><option>default</option></select>
         <div aria-label="Rich message" contentEditable />
       </div>
@@ -127,13 +128,13 @@ vi.mock('@/hooks/useSystemSettings', () => ({
     data: { reply_insert_mode: systemSettingsMocks.replyInsertMode },
   }),
 }))
-const sendStreamMocks = vi.hoisted(() => ({ isStreaming: false, send: vi.fn() }))
+const sendStreamMocks = vi.hoisted(() => ({ isStreaming: false, send: vi.fn(), cancel: vi.fn() }))
 vi.mock('@/hooks/useSendMessageStream', () => ({
   useSendMessageStream: () => ({
     error: null,
     isStreaming: sendStreamMocks.isStreaming,
     send: sendStreamMocks.send,
-    cancel: vi.fn(),
+    cancel: sendStreamMocks.cancel,
   }),
 }))
 vi.mock('@/stores/fileNavStore', () => ({ useFileNavStore: () => null }))
@@ -230,6 +231,7 @@ describe('ConversationChatView', () => {
     systemSettingsMocks.replyInsertMode = 'instant'
     sendStreamMocks.isStreaming = false
     sendStreamMocks.send.mockReset().mockResolvedValue(undefined)
+    sendStreamMocks.cancel.mockReset().mockResolvedValue(undefined)
     useQueuedMessagesStore.setState({ byStateId: {}, dispatchingByStateId: {} })
     Object.defineProperty(navigator, 'platform', { configurable: true, value: 'Win32' })
   })
@@ -530,6 +532,80 @@ describe('ConversationChatView', () => {
 
     await waitFor(() => expect(sendStreamMocks.send).toHaveBeenCalledWith('retry me'))
     expect(await screen.findByText(/1 message queued/)).toBeVisible()
+  })
+
+  it('does not release another group queue when a previous thread id is retained', async () => {
+    systemSettingsMocks.replyInsertMode = 'queue'
+    sendStreamMocks.isStreaming = true
+    const user = userEvent.setup()
+    const origin = { scope: 'groups' as const, conversationId: 'group-a', threadId: 'thread-a' }
+    const view = renderConversation(origin)
+    await user.type(screen.getByLabelText('Message'), 'only for group A{Enter}')
+
+    sendStreamMocks.isStreaming = false
+    view.rerender(conversationElement({ ...origin, conversationId: 'group-b' }))
+    expect(sendStreamMocks.send).not.toHaveBeenCalled()
+    expect(screen.queryByText(/message queued/)).not.toBeInTheDocument()
+
+    view.rerender(conversationElement(origin))
+    await waitFor(() => expect(sendStreamMocks.send).toHaveBeenCalledWith('only for group A'))
+  })
+
+  it.each(['send', 'resume'] as const)('clears only the current queue before stopping a %s', async (kind) => {
+    systemSettingsMocks.replyInsertMode = 'queue'
+    sendStreamMocks.isStreaming = true
+    const user = userEvent.setup()
+    const view = renderConversation({ conversationId: 'chat-2' })
+    await user.type(screen.getByLabelText('Message'), 'keep other queue{Enter}')
+    view.rerender(conversationElement())
+    const cancel = kind === 'send' ? sendStreamMocks.cancel : vi.fn().mockResolvedValue(undefined)
+    if (kind === 'resume') {
+      sendStreamMocks.isStreaming = false
+      messageStoreMocks.activeResumesByMessageId = {
+        'resume-1': { state_id: 'chat-1', cancel },
+      }
+      view.rerender(conversationElement())
+    }
+    await user.type(screen.getByLabelText('Message'), 'discard on stop{Enter}')
+    cancel.mockImplementation(() => {
+      expect(Object.values(useQueuedMessagesStore.getState().byStateId).flat()).toEqual(['keep other queue'])
+      return Promise.resolve()
+    })
+    await user.click(screen.getByRole('button', { name: 'Stop reply' }))
+    expect(cancel).toHaveBeenCalledTimes(1)
+    expect(screen.queryByText(/message queued/)).not.toBeInTheDocument()
+
+    sendStreamMocks.isStreaming = false
+    messageStoreMocks.activeResumesByMessageId = {}
+    view.rerender(conversationElement())
+    expect(sendStreamMocks.send).not.toHaveBeenCalled()
+    view.rerender(conversationElement({ conversationId: 'chat-2' }))
+    await waitFor(() => expect(sendStreamMocks.send).toHaveBeenCalledWith('keep other queue'))
+  })
+
+  it('does not restore a released message when stopping rejects its pending send', async () => {
+    systemSettingsMocks.replyInsertMode = 'queue'
+    sendStreamMocks.isStreaming = true
+    let rejectSend!: (error: Error) => void
+    sendStreamMocks.send.mockImplementationOnce(() => new Promise<void>((_resolve, reject) => {
+      rejectSend = reject
+    }))
+    const user = userEvent.setup()
+    const view = renderConversation()
+    await user.type(screen.getByLabelText('Message'), 'pending acknowledgement{Enter}')
+    sendStreamMocks.isStreaming = false
+    view.rerender(conversationElement())
+    expect(sendStreamMocks.send).toHaveBeenCalledTimes(1)
+
+    sendStreamMocks.isStreaming = true
+    view.rerender(conversationElement())
+    await user.click(screen.getByRole('button', { name: 'Stop reply' }))
+    await act(async () => rejectSend(new Error('cancelled')))
+    sendStreamMocks.isStreaming = false
+    view.rerender(conversationElement())
+    expect(screen.queryByText(/message queued/)).not.toBeInTheDocument()
+    expect(useQueuedMessagesStore.getState().byStateId).toEqual({})
+    expect(sendStreamMocks.send).toHaveBeenCalledTimes(1)
   })
 
   it('sends immediately while streaming in the default instant mode', async () => {

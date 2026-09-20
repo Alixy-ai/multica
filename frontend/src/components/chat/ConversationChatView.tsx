@@ -29,7 +29,7 @@ import type { ConversationUpdatedPayload } from '@/lib/api-v2/types'
 import { useConversationActivityStore } from '@/stores/conversationActivityStore'
 import { useFileNavStore } from '@/stores/fileNavStore'
 import { useMessageStore } from '@/stores/messageStore'
-import { useQueuedMessagesStore } from '@/stores/queuedMessagesStore'
+import { queuedMessagesKey, useQueuedMessagesStore } from '@/stores/queuedMessagesStore'
 import { useOptionalTerminalRuntime } from '@/terminal/TerminalRuntimeProvider'
 import { useOptionalTerminalConversationRegistration } from '@/terminal/useTerminalConversationRegistration'
 import type { GroupAgentRead, MessageSendInput } from '@/types/api'
@@ -158,6 +158,7 @@ export function ConversationChatView({
     threadWorktreePath,
   )
   const stateId = threadId ?? conversationId
+  const queueKey = queuedMessagesKey(scope, conversationId, threadId)
   const messagesQuery = useConversationMessages(scope, conversationId, threadId)
   const enhancePrompt = useEnhanceGroupPrompt(conversationId, threadId)
   const enhancementAgents = useMemo(
@@ -187,9 +188,12 @@ export function ConversationChatView({
   )
   const isConversationStreaming = stream.isStreaming || activeResumes.length > 0
   const cancelConversationStream = useCallback(() => {
+    // Note: cancel can end a stream or reject a send before acknowledgement.
+    // Invalidate queued releases first so neither path can restart the queue.
+    useQueuedMessagesStore.getState().clear(queueKey)
     if (stream.isStreaming) void stream.cancel()
     for (const resume of activeResumes) void resume.cancel()
-  }, [activeResumes, stream])
+  }, [activeResumes, queueKey, stream])
 
   // What to do with a message typed while the previous reply is still running.
   // `instant` is the original behaviour: the send goes out now and joins the
@@ -200,19 +204,19 @@ export function ConversationChatView({
   const systemSettings = useSystemSettings()
   const replyInsertMode = systemSettings.data?.reply_insert_mode ?? 'instant'
   const queuedCount = useQueuedMessagesStore(
-    (state) => state.byStateId[stateId]?.length ?? 0,
+    (state) => state.byStateId[queueKey]?.length ?? 0,
   )
   const enqueueQueued = useQueuedMessagesStore((state) => state.enqueue)
   const clearQueuedMessages = useCallback(
-    () => useQueuedMessagesStore.getState().clear(stateId),
-    [stateId],
+    () => useQueuedMessagesStore.getState().clear(queueKey),
+    [queueKey],
   )
   const sendOrQueueMessage = useCallback(
     (input: MessageSendInput) => {
       if (replyInsertMode !== 'queue' || !isConversationStreaming) return sendMessage(input)
-      enqueueQueued(stateId, [input])
+      enqueueQueued(queueKey, [input])
     },
-    [enqueueQueued, isConversationStreaming, replyInsertMode, sendMessage, stateId],
+    [enqueueQueued, isConversationStreaming, replyInsertMode, sendMessage, queueKey],
   )
 
   // One at a time: releasing the whole queue at once would put every message
@@ -223,20 +227,20 @@ export function ConversationChatView({
   useEffect(() => {
     if (isConversationStreaming) return
     const queue = useQueuedMessagesStore.getState()
-    const next = queue.beginDispatch(stateId)
-    if (!next) return
+    const dispatch = queue.beginDispatch(queueKey)
+    if (!dispatch) return
     let pending: Promise<void>
     try {
-      pending = sendMessage(next)
+      pending = sendMessage(dispatch.input)
     } catch {
-      useQueuedMessagesStore.getState().finishDispatch(stateId, next)
+      useQueuedMessagesStore.getState().finishDispatch(queueKey, dispatch, true)
       return
     }
     void pending.then(
-      () => useQueuedMessagesStore.getState().finishDispatch(stateId),
-      () => useQueuedMessagesStore.getState().finishDispatch(stateId, next),
+      () => useQueuedMessagesStore.getState().finishDispatch(queueKey, dispatch),
+      () => useQueuedMessagesStore.getState().finishDispatch(queueKey, dispatch, true),
     )
-  }, [isConversationStreaming, sendMessage, stateId])
+  }, [isConversationStreaming, sendMessage, queueKey])
   const fileNavRequest = useFileNavStore((state) => state.request)
   const registerConversationTitles = useConversationActivityStore(
     (state) => state.registerConversationTitles,

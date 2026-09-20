@@ -78,11 +78,12 @@ describe('authStore window synchronization', () => {
     const queued = useQueuedMessagesStore.getState()
     const input = { content: 'old-account secret', attachments: [] }
     queued.enqueue('chat-1', [input])
-    expect(queued.beginDispatch('chat-1')).toEqual(input)
+    const dispatch = queued.beginDispatch('chat-1')!
+    expect(dispatch.input).toEqual(input)
 
     useAuthStore.setState({ token: 'old-token' })
     useAuthStore.getState().logout()
-    useQueuedMessagesStore.getState().finishDispatch('chat-1', input)
+    useQueuedMessagesStore.getState().finishDispatch('chat-1', dispatch, true)
 
     expect(useQueuedMessagesStore.getState().byStateId).toEqual({})
     expect(useQueuedMessagesStore.getState().dispatchingByStateId).toEqual({})
