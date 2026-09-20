@@ -1173,53 +1173,14 @@ async fn run_scheduled_turn(
             let mut selected_agent_id = None;
             let mut moderator_finished = false;
             // Note: the decision model answers first, and only the question its
-            // switch covers. A bounded turn asks it to pick the speaker; an
-            // automatic turn asks whether the objective is done. Either answer
-            // replaces one chat-model moderator call. No answer (switched off,
-            // failed, or not confident) leaves the moderator path as it was.
+            // switch covers. Automatic completion runs before speaker selection
+            // so completed work is not dispatched again. Selection may defer;
+            // failure or uncertainty leaves the chat moderator path intact.
             let mut decision_selected = false;
             let mut decision_resolved = false;
             if may_call_moderator {
                 let turn_context = decision_turn_context(&moderator_objective, &scheduler_runtime);
-                if !automatic_scheduler && moderator_candidates.len() >= 2 {
-                    if let Some(gate) = ctx.decision_for(DecisionScenario::ModeratorSelection) {
-                        let speakers = moderator_candidates
-                            .iter()
-                            .filter_map(|candidate| {
-                                remaining
-                                    .iter()
-                                    .flatten()
-                                    .find(|agent| agent.agent_id == candidate.agent_id)
-                            })
-                            .map(|agent| decision::SpeakerCandidate {
-                                agent_id: agent.agent_id.clone(),
-                                display_name: agent.display_name.clone(),
-                                role: agent.system_prompt.clone(),
-                                topology_role: agent.topology_role.clone(),
-                            })
-                            .collect::<Vec<_>>();
-                        match await_with_cancellation(
-                            ctx,
-                            decision::select_speaker(&gate, &turn_context, &speakers),
-                        )
-                        .await
-                        {
-                            Ok(Some(selection)) => {
-                                tracing::info!(
-                                    turn_id,
-                                    agent_id = %selection.agent_id,
-                                    confidence = selection.confidence,
-                                    "decision model selected the next speaker"
-                                );
-                                selected_agent_id = Some(selection.agent_id);
-                                decision_selected = true;
-                                decision_resolved = true;
-                            }
-                            Ok(None) => {}
-                            Err(_) => return cancel_scheduled_turn(ctx, &store, &turn_id).await,
-                        }
-                    }
-                } else if automatic_scheduler && scheduler_runtime.budget.agent_steps() > 0 {
+                if automatic_scheduler && scheduler_runtime.budget.agent_steps() > 0 {
                     if let Some(gate) = ctx.decision_for(DecisionScenario::AutomaticFinish) {
                         match await_with_cancellation(
                             ctx,
@@ -1239,6 +1200,55 @@ async fn run_scheduled_turn(
                                 decision_resolved = true;
                             }
                             Ok(_) => {}
+                            Err(_) => return cancel_scheduled_turn(ctx, &store, &turn_id).await,
+                        }
+                    }
+                }
+                if !decision_resolved
+                    && (moderator_candidates.len() >= 2
+                        || automatic_scheduler && !moderator_candidates.is_empty())
+                {
+                    if let Some(gate) = ctx.decision_for(DecisionScenario::ModeratorSelection) {
+                        let speakers = moderator_candidates
+                            .iter()
+                            .filter_map(|candidate| {
+                                remaining
+                                    .iter()
+                                    .flatten()
+                                    .find(|agent| agent.agent_id == candidate.agent_id)
+                            })
+                            .map(|agent| decision::SpeakerCandidate {
+                                agent_id: agent.agent_id.clone(),
+                                display_name: agent.display_name.clone(),
+                                role: agent.system_prompt.clone(),
+                                topology_role: agent.topology_role.clone(),
+                            })
+                            .collect::<Vec<_>>();
+                        match await_with_cancellation(ctx, async {
+                            if automatic_scheduler {
+                                decision::select_automatic_speaker(&gate, &turn_context, &speakers)
+                                    .await
+                            } else {
+                                decision::select_speaker(&gate, &turn_context, &speakers).await
+                            }
+                        })
+                        .await
+                        {
+                            Ok(Some(selection)) => {
+                                tracing::info!(
+                                    turn_id,
+                                    agent_id = %selection.agent_id,
+                                    confidence = selection.confidence,
+                                    "decision model selected the next speaker"
+                                );
+                                selected_agent_id = Some(selection.agent_id);
+                                // The evaluator cannot generate a work assignment or
+                                // summary. Keep existing progress and let the agent
+                                // use the objective and conversation already supplied.
+                                decision_selected = true;
+                                decision_resolved = true;
+                            }
+                            Ok(None) => {}
                             Err(_) => return cancel_scheduled_turn(ctx, &store, &turn_id).await,
                         }
                     }
@@ -1501,6 +1511,22 @@ async fn run_scheduled_turn(
             scheduler_runtime
                 .budget
                 .record_tokens(flush_decision_usage(services, ctx, group).await);
+            // Note: completion can follow a decision call without another
+            // dispatch, so persist its tokens before making the turn terminal.
+            if store
+                .update_turn_budget(
+                    &turn_id,
+                    scheduler_runtime.budget.agent_steps() as i64,
+                    scheduler_runtime.budget.moderator_calls() as i64,
+                    scheduler_runtime.budget.consecutive_failures() as i64,
+                    scheduler_runtime.budget.total_failures() as i64,
+                    scheduler_runtime.budget.total_tokens() as i64,
+                )
+                .await
+                .is_err()
+            {
+                return fail_scheduled_persistence(ctx, &store, &turn_id).await;
+            }
             let (status, reason, outcome) = match status {
                 TurnStatus::Silence if had_visible => {
                     (TurnStatus::Completed, None, TurnOutcome::Completed)

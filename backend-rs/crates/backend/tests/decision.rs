@@ -1080,6 +1080,291 @@ async fn decision_moderator_selection_replaces_the_moderator_call() {
 }
 
 #[tokio::test]
+async fn decision_automatic_selects_again_then_finishes_without_chat_moderator() {
+    let (app, state) = router_with_state_for_tests().await;
+    let token = register_and_login(&app, "decision-automatic@example.com").await;
+    let owner = owner_id(&state, "decision-automatic@example.com").await;
+    let workspace = create_workspace(&app, &token).await;
+    let moderator_provider = seed_provider(&state, &owner, &unreachable_local_url().await).await;
+    let group = create_group(
+        &app,
+        &token,
+        &workspace,
+        json!({
+            "free_speech": true,
+            "scheduler_mode": "automatic",
+            "max_agent_steps": 5,
+            "max_steps_per_agent": 3,
+            "max_consecutive_failures": 1,
+            "max_total_failures": 1,
+            "moderator_enabled": true,
+            "moderator_provider_id": moderator_provider,
+            "moderator_model": "moderator-model",
+        }),
+    )
+    .await;
+    let provider = seed_provider(
+        &state,
+        &owner,
+        &fake_provider_sequence(vec![
+            text_body("API implemented. Frontend integration remains."),
+            text_body("Frontend integration and verification completed."),
+        ])
+        .await,
+    )
+    .await;
+    for (name, role, joined) in [
+        ("Alice", "Frontend.", "2024-01-01T00:00:00Z"),
+        ("Bob", "Backend.", "2024-01-02T00:00:00Z"),
+    ] {
+        seed_agent(&state, &owner, &group, &provider, name, role, joined).await;
+    }
+    let (endpoint, requests) = fake_decision_endpoint(vec![
+        choice_body("speaker", "candidate_1", 0.95),
+        noul_body(&[("complete", 0.1)]),
+        choice_body("speaker", "candidate_0", 0.95),
+        noul_body(&[("complete", 0.95)]),
+    ])
+    .await;
+    enable_decision(
+        &app,
+        &token,
+        &group,
+        &endpoint,
+        json!({
+            "moderator_selection": true, "automatic_finish": true,
+        }),
+    )
+    .await;
+    stream_events(
+        &app,
+        &stream_uri(&group),
+        &token,
+        json!({
+            "content": "Implement the API and connect the frontend, then verify both."
+        }),
+    )
+    .await;
+
+    let rows = dispatch_rows(&state, &group).await;
+    assert_eq!(rows.len(), 2);
+    assert_eq!((&*rows[0].0, &*rows[0].1), ("Bob", "decision_model"));
+    assert_eq!((&*rows[1].0, &*rows[1].1), ("Alice", "decision_model"));
+    let turn: (String, i64, i64, i64) = sqlx::query_as(
+        "SELECT status, moderator_calls, total_failures, total_tokens FROM group_turns WHERE group_id = ?",
+    ).bind(&group).fetch_one(state.db.pool()).await.unwrap();
+    assert_eq!((&*turn.0, turn.1, turn.2), ("completed", 0, 0));
+    assert!(
+        turn.3 >= 140,
+        "all four decision calls count toward the budget"
+    );
+    let sent = requests.lock().await;
+    assert_eq!(
+        sent.len(),
+        4,
+        "completion takes precedence over another selection"
+    );
+    assert!(sent[0]["questions"]["speaker"]["criteria"]["defer"].is_string());
+    assert!(sent[1]["questions"]["complete"].is_object());
+    assert_eq!(sent[2]["state"]["candidates"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        sent[2]["state"]["candidates"][0]["name"], "Alice",
+        "last speaker is excluded"
+    );
+    assert_eq!(
+        sent[2]["questions"]["speaker"]["criteria"]
+            .as_object()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert!(sent[2]["state"]["recent_messages"]
+        .to_string()
+        .contains("Frontend integration remains"));
+}
+
+#[tokio::test]
+async fn decision_automatic_selection_falls_back_without_finishing_on_its_own() {
+    for (case, answer, enabled) in [
+        ("defer", choice_body("speaker", "defer", 0.99), true),
+        ("low", choice_body("speaker", "candidate_0", 0.3), true),
+        (
+            "unknown",
+            choice_body("speaker", "candidate_99", 0.99),
+            true,
+        ),
+        ("missing", noul_body(&[]), true),
+        (
+            "disabled",
+            choice_body("speaker", "candidate_0", 0.99),
+            false,
+        ),
+        ("http", json!(null), true),
+    ] {
+        let (app, state) = router_with_state_for_tests().await;
+        let email = format!("decision-auto-{case}@example.com");
+        let token = register_and_login(&app, &email).await;
+        let owner = owner_id(&state, &email).await;
+        let workspace = create_workspace(&app, &token).await;
+        let moderator_provider = seed_provider(
+            &state,
+            &owner,
+            &fake_provider_sequence(vec![text_body(
+                r#"{"action":"finish","summary":"The objective is already complete."}"#,
+            )])
+            .await,
+        )
+        .await;
+        let group = create_group(
+            &app,
+            &token,
+            &workspace,
+            json!({
+                "free_speech": true,
+                "scheduler_mode": "automatic",
+                "max_agent_steps": 3,
+                "moderator_enabled": true,
+                "moderator_provider_id": moderator_provider,
+                "moderator_model": "moderator-model",
+            }),
+        )
+        .await;
+        let provider = seed_provider(&state, &owner, &unreachable_local_url().await).await;
+        seed_agent(
+            &state,
+            &owner,
+            &group,
+            &provider,
+            "Alice",
+            "Frontend.",
+            "2024-01-01T00:00:00Z",
+        )
+        .await;
+        let (endpoint, requests) = fake_decision_endpoint(vec![answer]).await;
+        let endpoint = if case == "http" {
+            failing_decision_endpoint(StatusCode::BAD_REQUEST).await
+        } else {
+            endpoint
+        };
+        enable_decision(
+            &app,
+            &token,
+            &group,
+            &endpoint,
+            json!({
+                "moderator_selection": enabled,
+            }),
+        )
+        .await;
+        stream_events(
+            &app,
+            &stream_uri(&group),
+            &token,
+            json!({"content": "Check the objective."}),
+        )
+        .await;
+        assert!(dispatch_rows(&state, &group).await.is_empty(), "{case}");
+        let turn: (String, i64, i64) = sqlx::query_as(
+            "SELECT status, moderator_calls, total_failures FROM group_turns WHERE group_id = ?",
+        )
+        .bind(&group)
+        .fetch_one(state.db.pool())
+        .await
+        .unwrap();
+        assert_eq!((&*turn.0, turn.1, turn.2), ("completed", 1, 0), "{case}");
+        let sent = requests.lock().await;
+        assert_eq!(sent.len(), usize::from(enabled && case != "http"), "{case}");
+        for request in sent.iter() {
+            assert!(
+                request["questions"].get("complete").is_none(),
+                "finish switch remains off"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn decision_automatic_selection_runs_with_finish_disabled_and_respects_token_budget() {
+    for (max_tokens, expected_dispatches) in [(10_000, 1), (35, 0)] {
+        let (app, state) = router_with_state_for_tests().await;
+        let token = register_and_login(&app, "decision-auto-budget@example.com").await;
+        let owner = owner_id(&state, "decision-auto-budget@example.com").await;
+        let workspace = create_workspace(&app, &token).await;
+        let moderator_provider =
+            seed_provider(&state, &owner, &unreachable_local_url().await).await;
+        let group = create_group(
+            &app,
+            &token,
+            &workspace,
+            json!({
+                "free_speech": true,
+                "scheduler_mode": "automatic",
+                "max_agent_steps": 3,
+                "max_total_tokens": max_tokens,
+                "moderator_enabled": true,
+                "moderator_provider_id": moderator_provider,
+                "moderator_model": "moderator-model",
+            }),
+        )
+        .await;
+        let provider = seed_provider(
+            &state,
+            &owner,
+            &fake_provider_sequence(vec![text_body(
+                "<WAITING_FOR_USER> Which frontend should I connect?",
+            )])
+            .await,
+        )
+        .await;
+        seed_agent(
+            &state,
+            &owner,
+            &group,
+            &provider,
+            "Alice",
+            "Frontend.",
+            "2024-01-01T00:00:00Z",
+        )
+        .await;
+        let (endpoint, requests) =
+            fake_decision_endpoint(vec![choice_body("speaker", "candidate_0", 0.95)]).await;
+        enable_decision(
+            &app,
+            &token,
+            &group,
+            &endpoint,
+            json!({"moderator_selection": true}),
+        )
+        .await;
+        stream_events(
+            &app,
+            &stream_uri(&group),
+            &token,
+            json!({"content": "Connect the frontend."}),
+        )
+        .await;
+        let rows = dispatch_rows(&state, &group).await;
+        assert_eq!(rows.len(), expected_dispatches);
+        if let Some(row) = rows.first() {
+            assert_eq!(row.1, "decision_model");
+        }
+        let turn: (String, i64) =
+            sqlx::query_as("SELECT status, moderator_calls FROM group_turns WHERE group_id = ?")
+                .bind(&group)
+                .fetch_one(state.db.pool())
+                .await
+                .unwrap();
+        assert_eq!(turn.1, 0);
+        if max_tokens == 35 {
+            assert_eq!(turn.0, "budget_exhausted");
+        }
+        let sent = requests.lock().await;
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0]["questions"].get("complete").is_none());
+    }
+}
+
+#[tokio::test]
 async fn decision_moderator_selection_low_confidence_falls_back_to_moderator() {
     let (app, state) = router_with_state_for_tests().await;
     let token = register_and_login(&app, "decision-moderator-low@example.com").await;

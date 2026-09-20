@@ -1038,7 +1038,7 @@ export const enUS = {
         enabledDescription: 'Uses the endpoint saved under Settings → Decision model. Scenarios below only run while this is on.',
         endpointMissing: 'No decision endpoint or API key is saved yet. Add one under Settings → Decision model.',
         moderator_selection: 'Speaker selection',
-        moderator_selectionDescription: 'Bounded turns with a moderator: pick the next speaker from the legal candidates instead of asking the moderator model.',
+        moderator_selectionDescription: 'Bounded and automatic turns: pick the next legal speaker. Unclear unfinished work or low confidence falls back to the moderator model.',
         automatic_finish: 'Automatic finish',
         automatic_finishDescription: 'Automatic turns: end the turn when the objective reads as complete, before the moderator model is called.',
         proactive_prefilter: 'Proactive pre-filter',

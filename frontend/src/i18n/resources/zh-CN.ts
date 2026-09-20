@@ -939,7 +939,7 @@ export const zhCN: TranslationShape<typeof enUS> = {
         enabledDescription: '使用「设置 → 决策模型」中保存的端点。下方场景仅在开启时生效。',
         endpointMissing: '尚未保存决策端点或 API 密钥，请先在「设置 → 决策模型」中配置。',
         moderator_selection: '发言者选择',
-        moderator_selectionDescription: '带主持模型的 bounded 回合：从合法候选中直接选出下一位发言者，不再调用主持模型。',
+        moderator_selectionDescription: '支持 bounded 和 automatic 回合：从合法候选中选择下一位发言者；未完成工作不明确或置信度不足时回退主持模型。',
         automatic_finish: '自动结束',
         automatic_finishDescription: 'automatic 回合：目标已完成时提前结束回合，不再调用主持模型。',
         proactive_prefilter: '主动模式预筛选',

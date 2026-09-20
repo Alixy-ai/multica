@@ -49,7 +49,7 @@ Per group (`PATCH /api/v2/groups/{id}`, and saved into group templates):
 
 | Scenario | What it does | Fallback |
 | --- | --- | --- |
-| `moderator_selection` | Bounded turns with a moderator: picks the next speaker from the legal candidates. The dispatch records reason `decision_model`. | The moderator chat model is asked as before |
+| `moderator_selection` | Bounded and automatic turns with a moderator: picks the next legal speaker. Automatic selection includes a `defer` option when no concrete unfinished work is supported, including with one candidate. The dispatch records reason `decision_model`. | On defer, failure or low confidence, the moderator chat model is asked as before |
 | `automatic_finish` | Automatic turns: ends the turn when the objective reads as complete (probability ≥ 0.85), before the moderator is called | The moderator decides |
 | `proactive_prefilter` | Proactive and everyone modes: skips members the latest message clearly does not call for (probability < 0.15). Mentioned members are never skipped; at least one member always runs. A `warning` event with code `decision_prefilter` lists who was skipped | Everyone is dispatched |
 | `shell_risk` | A second opinion on shell commands the fixed policy allowed. It can only add an approval card (rule `decision-risk`), never remove one | The policy verdict stands |
