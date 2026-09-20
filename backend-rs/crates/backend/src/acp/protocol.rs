@@ -129,6 +129,8 @@ enum WriterMessage {
 
 /// A live ACP stdio JSON-RPC connection to a spawned agent child process.
 pub struct AcpConnection {
+    /// Host-owned MCP configuration for both new and restored sessions.
+    pub(super) mcp_servers: Vec<Value>,
     writer_tx: mpsc::UnboundedSender<WriterMessage>,
     pending: PendingMap,
     events_tx: EventSink,
@@ -204,6 +206,7 @@ impl AcpConnection {
         });
 
         Self {
+            mcp_servers: Vec::new(),
             writer_tx,
             pending,
             events_tx,

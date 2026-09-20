@@ -9,10 +9,9 @@
 
 use qunica_backend::acp::{
     normalize_acp_runtime, probe_acp_runtime_capabilities, run_acp_agent_stream,
-    shutdown_reusable_acp_session, shutdown_reusable_acp_sessions, AcpCapabilityError,
-    AcpConfigValue, AcpEventKind, AcpImage, AcpRunAudit, AcpRunContext, AcpRunRequest,
-    AcpRuntimeConfig, AcpRuntimeProfile, PermissionPolicy, BLOCKED_ENV_KEYS,
-    DEFAULT_TIMEOUT_SECONDS, MAX_TAIL_CHARS,
+    shutdown_reusable_acp_session, AcpCapabilityError, AcpConfigValue, AcpEventKind, AcpImage,
+    AcpRunAudit, AcpRunContext, AcpRunRequest, AcpRuntimeConfig, AcpRuntimeProfile,
+    PermissionPolicy, BLOCKED_ENV_KEYS, DEFAULT_TIMEOUT_SECONDS, MAX_TAIL_CHARS,
 };
 use qunica_backend::db::Db;
 use serde_json::{json, Value};
@@ -477,6 +476,7 @@ async fn acp_lifecycle_run_persists_running_and_completed_audit_rows() {
     let mut run = run_acp_agent_stream(
         pool.clone(),
         AcpRunRequest {
+            notes: None,
             owner_id,
             group_id: None,
             agent_id,
@@ -570,6 +570,7 @@ async fn acp_lifecycle_timeout_kills_child_and_persists_failed_status() {
     let mut run = run_acp_agent_stream(
         pool.clone(),
         AcpRunRequest {
+            notes: None,
             owner_id,
             group_id: None,
             agent_id,
@@ -634,6 +635,7 @@ async fn acp_lifecycle_failed_child_exit_code_is_persisted() {
     let mut run = run_acp_agent_stream(
         pool.clone(),
         AcpRunRequest {
+            notes: None,
             owner_id,
             group_id: None,
             agent_id,
@@ -672,6 +674,7 @@ async fn acp_lifecycle_stream_cancel_kills_child_and_persists_cancelled_status()
     let mut run = run_acp_agent_stream(
         pool.clone(),
         AcpRunRequest {
+            notes: None,
             owner_id,
             group_id: None,
             agent_id,
@@ -728,6 +731,7 @@ async fn assert_child_env_is_isolated_for_profile(
     let mut run = run_acp_agent_stream(
         pool.clone(),
         AcpRunRequest {
+            notes: None,
             owner_id: owner_id.to_string(),
             group_id: None,
             agent_id: agent_id.to_string(),
@@ -836,6 +840,7 @@ async fn acp_lifecycle_applies_session_settings_and_emits_updates() {
     let mut run = run_acp_agent_stream(
         pool.clone(),
         AcpRunRequest {
+            notes: None,
             owner_id,
             group_id: None,
             agent_id,
@@ -924,6 +929,7 @@ async fn acp_lifecycle_warns_instead_of_failing_when_settings_are_unimplemented(
     let mut run = run_acp_agent_stream(
         pool.clone(),
         AcpRunRequest {
+            notes: None,
             owner_id,
             group_id: None,
             agent_id,
@@ -998,6 +1004,7 @@ async fn acp_lifecycle_fails_when_an_implemented_config_option_is_rejected() {
     let mut run = run_acp_agent_stream(
         pool.clone(),
         AcpRunRequest {
+            notes: None,
             owner_id,
             group_id: None,
             agent_id,
@@ -1032,6 +1039,7 @@ async fn acp_lifecycle_reuses_keyed_session_and_sends_incremental_prompt() {
     let first = run_and_collect_tokens(
         pool.clone(),
         AcpRunRequest {
+            notes: None,
             owner_id: owner_id.clone(),
             group_id: Some(group_id.clone()),
             agent_id: agent_id.clone(),
@@ -1051,10 +1059,11 @@ async fn acp_lifecycle_reuses_keyed_session_and_sends_incremental_prompt() {
     let second = run_and_collect_tokens(
         pool.clone(),
         AcpRunRequest {
+            notes: None,
             owner_id,
-            group_id: Some(group_id),
-            agent_id,
-            thread_id: Some(thread_id),
+            group_id: Some(group_id.clone()),
+            agent_id: agent_id.clone(),
+            thread_id: Some(thread_id.clone()),
             config,
             cwd: cwd.path().to_path_buf(),
             prompt: "FULL_CONTEXT_TWO".to_string(),
@@ -1076,7 +1085,8 @@ async fn acp_lifecycle_reuses_keyed_session_and_sends_incremental_prompt() {
     assert_eq!(second_payload["new_count"], json!(1));
     assert_eq!(second_payload["prompt_count"], json!(2));
     assert_eq!(second_payload["prompt"], json!("INCREMENT_TWO"));
-    shutdown_reusable_acp_sessions().await;
+    // Each parallel test owns only its own session.
+    shutdown_reusable_acp_session(&group_id, &thread_id, &agent_id).await;
 }
 
 /// A turn against a live agent process, returning its streamed text and any
@@ -1130,6 +1140,7 @@ struct ResumedConversation<'a> {
 impl ResumedConversation<'_> {
     fn turn(&self, full_prompt: &str, incremental_prompt: &str) -> AcpRunRequest {
         AcpRunRequest {
+            notes: None,
             owner_id: self.owner_id.to_string(),
             group_id: Some(self.group_id.to_string()),
             agent_id: self.agent_id.to_string(),
@@ -1270,6 +1281,7 @@ async fn acp_lifecycle_sends_images_as_standard_prompt_blocks() {
     let response = run_and_collect_tokens(
         pool,
         AcpRunRequest {
+            notes: None,
             owner_id,
             group_id: None,
             agent_id,
@@ -1319,6 +1331,7 @@ async fn acp_lifecycle_omits_images_when_agent_does_not_advertise_support() {
     let response = run_and_collect_tokens(
         pool,
         AcpRunRequest {
+            notes: None,
             owner_id,
             group_id: None,
             agent_id,
@@ -1357,6 +1370,7 @@ async fn acp_lifecycle_blocks_visual_claims_when_attachment_bytes_are_unavailabl
     let response = run_and_collect_tokens(
         pool,
         AcpRunRequest {
+            notes: None,
             owner_id,
             group_id: None,
             agent_id,
@@ -1391,6 +1405,7 @@ async fn acp_lifecycle_context_hash_change_restarts_keyed_session() {
     let _ = run_and_collect_tokens(
         pool.clone(),
         AcpRunRequest {
+            notes: None,
             owner_id: owner_id.clone(),
             group_id: Some(group_id.clone()),
             agent_id: agent_id.clone(),
@@ -1410,10 +1425,11 @@ async fn acp_lifecycle_context_hash_change_restarts_keyed_session() {
     let second = run_and_collect_tokens(
         pool.clone(),
         AcpRunRequest {
+            notes: None,
             owner_id,
-            group_id: Some(group_id),
-            agent_id,
-            thread_id: Some(thread_id),
+            group_id: Some(group_id.clone()),
+            agent_id: agent_id.clone(),
+            thread_id: Some(thread_id.clone()),
             config,
             cwd: cwd.path().to_path_buf(),
             prompt: "FULL_CONTEXT_TWO".to_string(),
@@ -1431,7 +1447,8 @@ async fn acp_lifecycle_context_hash_change_restarts_keyed_session() {
     assert_eq!(second_payload["new_count"], json!(1));
     assert_eq!(second_payload["prompt_count"], json!(1));
     assert_eq!(second_payload["prompt"], json!("FULL_CONTEXT_TWO"));
-    shutdown_reusable_acp_sessions().await;
+    // Each parallel test owns only its own session.
+    shutdown_reusable_acp_session(&group_id, &thread_id, &agent_id).await;
 }
 
 async fn run_and_collect_tokens(pool: SqlitePool, request: AcpRunRequest) -> String {
@@ -1870,6 +1887,7 @@ fn run_fake_child(mode: &str) {
     let mut prompt_count = 0;
     let mut load_count = 0;
     let mut loaded_session_id = String::new();
+    let mut notes_server = Value::Null;
 
     for line in stdin.lock().lines() {
         let Ok(line) = line else { break };
@@ -1905,7 +1923,7 @@ fn run_fake_child(mode: &str) {
                         }),
                     ),
                 ),
-                "resume" | "resume_refused" => write_line(
+                "resume" | "resume_refused" | "notes" => write_line(
                     &stdout,
                     &rpc_result(
                         &id,
@@ -1919,6 +1937,7 @@ fn run_fake_child(mode: &str) {
             },
             "session/new" => {
                 new_count += 1;
+                notes_server = params["mcpServers"][0].clone();
                 if mode == "capabilities_env" {
                     let summary = json!({
                         "cwd": std::env::current_dir().unwrap(),
@@ -1969,6 +1988,7 @@ fn run_fake_child(mode: &str) {
             }
             "session/load" => {
                 load_count += 1;
+                notes_server = params["mcpServers"][0].clone();
                 loaded_session_id = params
                     .get("sessionId")
                     .and_then(Value::as_str)
@@ -2078,6 +2098,21 @@ fn run_fake_child(mode: &str) {
                 write_line(&stdout, &rpc_result(&id, result));
             }
             "session/prompt" => match mode {
+                "notes" => {
+                    prompt_count += 1;
+                    let result = exercise_notes_relay(&notes_server);
+                    write_line(
+                        &stdout,
+                        &session_update(json!({
+                            "sessionUpdate":"agent_message_chunk",
+                            "content":{"type":"text","text":json!({
+                                "new_count":new_count,"load_count":load_count,
+                                "prompt_count":prompt_count,"note":result
+                            }).to_string()}
+                        })),
+                    );
+                    write_line(&stdout, &rpc_result(&id, json!({"stopReason":"end_turn"})));
+                }
                 // Hold the turn open so the parent can time out or cancel it.
                 "timeout" | "cancel" => {}
                 "env" => {
@@ -2383,4 +2418,164 @@ fn write_line(stdout: &std::io::Stdout, value: &Value) {
     let _ = handle.write_all(value.to_string().as_bytes());
     let _ = handle.write_all(b"\n");
     let _ = handle.flush();
+}
+
+// The production server command is current_exe; this fake ACP runs inside a
+// libtest executable, so substitute the packaged backend entrypoint only here.
+fn exercise_notes_relay(server: &Value) -> Value {
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::{Command, Stdio};
+    let mut command = Command::new(env!("CARGO_BIN_EXE_qunica-backend"));
+    command.args(
+        server["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap()),
+    );
+    for entry in server["env"].as_array().unwrap() {
+        command.env(
+            entry["name"].as_str().unwrap(),
+            entry["value"].as_str().unwrap(),
+        );
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let mut output = BufReader::new(child.stdout.take().unwrap());
+    let requests = [
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
+        json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"CreateGroupNote","arguments":{"title":"ACP-created note"}}}),
+    ];
+    let mut result = Value::Null;
+    for request in requests {
+        writeln!(input, "{request}").unwrap();
+        input.flush().unwrap();
+        let mut line = String::new();
+        output.read_line(&mut line).unwrap();
+        let response: Value =
+            serde_json::from_str(&line).expect("relay stdout contains only JSON-RPC");
+        assert_eq!(response["id"], request["id"]);
+        assert!(response.get("error").is_none(), "{response}");
+        result = response["result"].clone();
+        if request["id"] == 1 {
+            writeln!(
+                input,
+                "{}",
+                json!({"jsonrpc":"2.0","method":"notifications/initialized"})
+            )
+            .unwrap();
+            input.flush().unwrap();
+        }
+    }
+    drop(input);
+    assert!(child.wait().unwrap().success());
+    assert_eq!(result["isError"], false, "{result}");
+    serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap()
+}
+
+#[tokio::test]
+async fn acp_notes_mcp_mounts_on_new_load_and_reuse_and_revokes_between_dispatches() {
+    use qunica_backend::acp::notes_mcp::NotesContext;
+    let (pool, owner_id, agent_id, group_id, thread_id) = seeded_db().await;
+    let root = tempfile::tempdir().unwrap();
+    let own_workspace = tempfile::tempdir().unwrap();
+    let workspace = uuid::Uuid::new_v4().to_string();
+    sqlx::query("INSERT INTO workspaces (id,owner_id,name,backend_type,local_path,created_at,updated_at) VALUES (?,?,'Notes','local',?,'now','now')")
+        .bind(&workspace).bind(&owner_id).bind(root.path().to_string_lossy().as_ref()).execute(&pool).await.unwrap();
+    sqlx::query("UPDATE groups SET workspace_id = ? WHERE id = ?")
+        .bind(&workspace)
+        .bind(&group_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO group_agents (group_id,agent_id,joined_at,updated_at) VALUES (?,?,'now','now')").bind(&group_id).bind(&agent_id).execute(&pool).await.unwrap();
+    let log_path = root.path().join("acp.log");
+    let config = fake_child_config(
+        "notes",
+        "custom",
+        json!({"timeout_seconds":30,"env":{"ACP_FAKE_LOG":log_path.to_string_lossy()}}),
+    );
+    let conversation = ResumedConversation {
+        owner_id: &owner_id,
+        agent_id: &agent_id,
+        group_id: &group_id,
+        thread_id: &thread_id,
+        config: &config,
+        cwd: own_workspace.path(),
+    };
+    let context = NotesContext {
+        pool: pool.clone(),
+        owner_id: owner_id.clone(),
+        agent_id: agent_id.clone(),
+        group_id: group_id.clone(),
+        thread_id: thread_id.clone(),
+        write_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        decision: None,
+    };
+    for round in 0..3 {
+        if round == 2 {
+            conversation.restart().await;
+        }
+        let mut request = conversation.turn("Read group notes", "Update group notes");
+        request.notes = Some(context.clone());
+        let (text, warnings) = run_and_collect_turn(pool.clone(), request).await;
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let result: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(result["new_count"], if round == 2 { 0 } else { 1 });
+        assert_eq!(result["load_count"], if round == 2 { 1 } else { 0 });
+        assert_eq!(result["prompt_count"], if round == 1 { 2 } else { 1 });
+        let path = result["note"]["path"].as_str().unwrap();
+        assert!(root.path().join("Notes").join(path).is_file());
+        assert!(!own_workspace.path().join("Notes").exists());
+        let log = std::fs::read_to_string(&log_path).unwrap();
+        let config: Value = log
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .filter(|v| v["method"] == "session/new" || v["method"] == "session/load")
+            .next_back()
+            .unwrap()["params"]["mcpServers"][0]
+            .clone();
+        let env = config["env"].as_array().unwrap();
+        let endpoint = env
+            .iter()
+            .find(|v| v["name"] == "QUNICA_NOTES_MCP_ENDPOINT")
+            .unwrap()["value"]
+            .as_str()
+            .unwrap();
+        let token = env
+            .iter()
+            .find(|v| v["name"] == "QUNICA_NOTES_MCP_TOKEN")
+            .unwrap()["value"]
+            .as_str()
+            .unwrap();
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .post(endpoint)
+            .bearer_auth(token)
+            .json(&json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+    }
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM group_notes WHERE group_id = ?")
+        .bind(&group_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 3);
+    conversation.restart().await;
 }

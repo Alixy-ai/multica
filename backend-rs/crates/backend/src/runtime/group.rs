@@ -4296,6 +4296,16 @@ async fn run_acp_agent_turn(
         run_acp_agent_stream(
             services.pool.clone(),
             AcpRunRequest {
+                notes: (group.conversation_kind == "group" && conversation_workspace_root.is_some())
+                    .then(|| crate::acp::notes_mcp::NotesContext {
+                        pool: services.pool.clone(),
+                        write_lock: services.write_lock.clone(),
+                        owner_id: agent.owner_id.clone(),
+                        group_id: ctx.group_id.clone(),
+                        agent_id: agent.agent_id.clone(),
+                        thread_id: ctx.thread_id.clone(),
+                        decision: ctx.decision.clone(),
+                    }),
                 owner_id: agent.owner_id.clone(),
                 group_id: Some(ctx.group_id.clone()),
                 agent_id: agent.agent_id.clone(),
@@ -6944,13 +6954,21 @@ async fn build_agent_system_prompt(
     if let Some(suggestion) = capability_suggestion.render() {
         sections.push(suggestion);
     }
-    if executor.has_group_notes() {
+    let acp_notes = agent.runtime_kind == "acp"
+        && group.conversation_kind == "group"
+        && resolve_group_workspace_root(pool, group).await?.is_some();
+    if acp_notes {
+        sections.push(
+            "Shared group notes are provided by the qunica-group-notes MCP server: use its ReadGroupNotes, CreateGroupNote and EditGroupNote tools (the runtime may prefix their names). Read the index before creating a note to avoid duplicates. Use returned note paths unchanged; do not prefix Notes/. The host owns filenames and the index. If your runtime does not expose this MCP server, report that notes tools are unavailable; do not pretend to call them."
+                .to_string(),
+        );
+    } else if executor.has_group_notes() && agent.runtime_kind != "acp" {
         sections.push(
             "Shared group notes: use ReadGroupNotes only when relevant and EditGroupNote when durable shared context should change. Pass the note path returned by the index unchanged; do not prefix it with Notes/."
                 .to_string(),
         );
     }
-    if executor.has_group_notes() || agent.is_system {
+    if acp_notes || executor.has_group_notes() || agent.is_system {
         sections.push(crate::group_notes::AUTHORING_GUIDE.to_string());
     }
     if group.proactive_mode {

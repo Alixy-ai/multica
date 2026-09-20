@@ -3004,9 +3004,35 @@ pub(crate) async fn create_group_note_inner(
     group_id: &str,
     body: GroupNoteCreateRequest,
 ) -> Result<GroupNoteResponse, ApiError> {
+    create_group_note_with_pool(state.db.pool(), owner_id, group_id, body, None).await
+}
+
+/// A scoped MCP write can expire while waiting for SQLite or model validation.
+#[derive(Clone, Copy)]
+pub(crate) struct GroupNoteWriteGuard<'a> {
+    pub active: &'a std::sync::atomic::AtomicBool,
+    pub expected_content: Option<&'a str>,
+}
+
+fn check_note_write_guard(guard: Option<GroupNoteWriteGuard<'_>>) -> Result<(), ApiError> {
+    if guard.is_some_and(|g| !g.active.load(std::sync::atomic::Ordering::SeqCst)) {
+        return Err(ApiError::permission_denied(
+            "group notes access has expired",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) async fn create_group_note_with_pool(
+    pool: &SqlitePool,
+    owner_id: &str,
+    group_id: &str,
+    body: GroupNoteCreateRequest,
+    guard: Option<GroupNoteWriteGuard<'_>>,
+) -> Result<GroupNoteResponse, ApiError> {
     let group_id = validate_uuid(group_id, "group id")?;
-    let group = load_active_note_group(state.db.pool(), &group_id, owner_id).await?;
-    let root = group_notes_workspace_root(state.db.pool(), &group, &group.owner_id).await?;
+    let group = load_active_note_group(pool, &group_id, owner_id).await?;
+    let root = group_notes_workspace_root(pool, &group, &group.owner_id).await?;
     let title = validate_note_title(&body.title)?;
     let note_id = Uuid::new_v4().to_string();
     let now = now_rfc3339();
@@ -3015,10 +3041,11 @@ pub(crate) async fn create_group_note_inner(
         .filter(|content| !content.trim().is_empty())
         .unwrap_or_else(|| crate::group_notes::default_content(&title, &now[..10]));
 
-    let mut tx = crate::db::begin_write(state.db.pool())
+    let mut tx = crate::db::begin_write(pool)
         .await
         .map_err(|_| ApiError::internal("failed to start group note create transaction"))?;
 
+    check_note_write_guard(guard)?;
     sqlx::query(
         "INSERT INTO group_notes \
          (id, group_id, author_id, title, content, status, created_at, updated_at) \
@@ -3035,14 +3062,15 @@ pub(crate) async fn create_group_note_inner(
     .await
     .map_err(|_| ApiError::internal("failed to create group note"))?;
 
+    check_note_write_guard(guard)?;
     write_group_note_content(&root, &note_id, &content)?;
 
     tx.commit()
         .await
         .map_err(|_| ApiError::internal("failed to commit group note create"))?;
-    sync_group_note_index(state.db.pool(), &root, &group_id).await?;
+    sync_group_note_index(pool, &root, &group_id).await?;
 
-    let row = fetch_group_note_row(state.db.pool(), &group_id, &note_id)
+    let row = fetch_group_note_row(pool, &group_id, &note_id)
         .await?
         .ok_or_else(|| ApiError::internal("group note vanished after insert"))?;
     let content = read_group_note_content(&root, &row.id, &row.content)?;
@@ -3068,11 +3096,22 @@ pub(crate) async fn update_group_note_inner(
     note_id: &str,
     body: GroupNoteUpdateRequest,
 ) -> Result<GroupNoteResponse, ApiError> {
+    update_group_note_with_pool(state.db.pool(), owner_id, group_id, note_id, body, None).await
+}
+
+pub(crate) async fn update_group_note_with_pool(
+    pool: &SqlitePool,
+    owner_id: &str,
+    group_id: &str,
+    note_id: &str,
+    body: GroupNoteUpdateRequest,
+    guard: Option<GroupNoteWriteGuard<'_>>,
+) -> Result<GroupNoteResponse, ApiError> {
     let group_id = validate_uuid(group_id, "group id")?;
     let note_id = validate_uuid(note_id, "note id")?;
-    let group = load_active_note_group(state.db.pool(), &group_id, owner_id).await?;
-    let root = group_notes_workspace_root(state.db.pool(), &group, &group.owner_id).await?;
-    let existing = load_active_group_note(state.db.pool(), &group_id, &note_id).await?;
+    let group = load_active_note_group(pool, &group_id, owner_id).await?;
+    let root = group_notes_workspace_root(pool, &group, &group.owner_id).await?;
+    let existing = load_active_group_note(pool, &group_id, &note_id).await?;
 
     let title = match body.title.as_deref() {
         Some(raw) => validate_note_title(raw)?,
@@ -3082,9 +3121,30 @@ pub(crate) async fn update_group_note_inner(
     let content = body.content.unwrap_or(existing.content);
     let now = now_rfc3339();
 
-    let mut tx = crate::db::begin_write(state.db.pool())
+    let mut tx = crate::db::begin_write(pool)
         .await
         .map_err(|_| ApiError::internal("failed to start group note update transaction"))?;
+
+    check_note_write_guard(guard)?;
+    if let Some(expected) = guard.and_then(|g| g.expected_content) {
+        // Note: MCP validates an edit before writing. Recheck under the same
+        // SQLite writer transaction used by UI updates so a slow model check
+        // cannot silently overwrite a newer edit.
+        let current: Option<String> = sqlx::query_scalar(
+            "SELECT content FROM group_notes WHERE id = ? AND group_id = ? AND status = 'active'",
+        )
+        .bind(&note_id)
+        .bind(&group_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|_| ApiError::internal("failed to check group note revision"))?;
+        let current = current.ok_or_else(|| ApiError::not_found("group note no longer exists"))?;
+        if read_group_note_content(&root, &note_id, &current)? != expected {
+            return Err(ApiError::conflict(
+                "group note changed; read it again before editing",
+            ));
+        }
+    }
 
     sqlx::query(
         "UPDATE group_notes SET title = ?, content = ?, updated_at = ? \
@@ -3099,6 +3159,7 @@ pub(crate) async fn update_group_note_inner(
     .await
     .map_err(|_| ApiError::internal("failed to update group note"))?;
 
+    check_note_write_guard(guard)?;
     if should_write_content {
         write_group_note_content(&root, &note_id, &content)?;
     }
@@ -3106,9 +3167,9 @@ pub(crate) async fn update_group_note_inner(
     tx.commit()
         .await
         .map_err(|_| ApiError::internal("failed to commit group note update"))?;
-    sync_group_note_index(state.db.pool(), &root, &group_id).await?;
+    sync_group_note_index(pool, &root, &group_id).await?;
 
-    let row = fetch_group_note_row(state.db.pool(), &group_id, &note_id)
+    let row = fetch_group_note_row(pool, &group_id, &note_id)
         .await?
         .ok_or_else(|| ApiError::internal("group note vanished after update"))?;
     let content = read_group_note_content(&root, &row.id, &row.content)?;
@@ -4602,6 +4663,15 @@ fn validate_git_commit_message(raw: &str) -> Result<String, ApiError> {
         ));
     }
     Ok(message)
+}
+
+pub(crate) async fn group_notes_root_for_owner(
+    pool: &SqlitePool,
+    owner_id: &str,
+    group_id: &str,
+) -> Result<PathBuf, ApiError> {
+    let group = load_active_note_group(pool, group_id, owner_id).await?;
+    group_notes_workspace_root(pool, &group, owner_id).await
 }
 
 async fn group_notes_workspace_root(

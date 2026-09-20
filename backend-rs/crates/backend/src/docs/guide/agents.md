@@ -44,7 +44,7 @@ For `llm_chat`, Qunica loads repository conventions from `AGENTS.md` in the prim
 | `ExitPlanMode` | no | Present a plan for approval |
 | `SkillManager` | no | List and load mounted skills |
 
-An agent with no tools configured gets `Read`, `Glob`, and `Grep`. Shared-note tools are mounted automatically for members of a group that has a local workspace.
+An `llm_chat` agent with no tools configured gets `Read`, `Glob`, and `Grep`. Shared-note tools are mounted automatically when the local group's notes directory is available. ACP agents instead receive the built-in `qunica-group-notes` MCP server, with `ReadGroupNotes`, `CreateGroupNote` and `EditGroupNote`, for groups with a local workspace; see [Shared notes](groups.md#shared-notes).
 
 `AgentAsTool` is the host-level group delegation mechanism. Its target list is computed for each turn: it contains only bound, active, unselected group helpers allowed by the topology. Every call must explicitly choose a mode.
 

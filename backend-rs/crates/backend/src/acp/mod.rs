@@ -16,6 +16,7 @@
 pub mod capabilities;
 pub mod config;
 pub mod dsh;
+pub mod notes_mcp;
 pub mod process;
 pub mod protocol;
 mod session_store;
@@ -160,6 +161,8 @@ pub enum AcpRunJoinError {
 
 /// Everything needed to start one ACP turn.
 pub struct AcpRunRequest {
+    /// Authority for the built-in notes MCP server, only for a group dispatch.
+    pub notes: Option<notes_mcp::NotesContext>,
     /// Owning user id.
     pub owner_id: String,
     /// Group id, if part of a group turn.
@@ -304,6 +307,7 @@ pub async fn run_acp_agent_stream(
     };
 
     let task = DriveTask {
+        notes: request.notes,
         audit,
         pool,
         run_id: run_id.clone(),
@@ -359,6 +363,7 @@ struct TurnOutcome {
 
 /// All state the background driver task owns.
 struct DriveTask {
+    notes: Option<notes_mcp::NotesContext>,
     audit: AcpRunAudit,
     pool: SqlitePool,
     run_id: String,
@@ -384,6 +389,7 @@ struct DriveTask {
 /// Drive one turn to completion and persist its terminal audit state.
 async fn drive_run(task: DriveTask) -> Result<(), AcpRunJoinError> {
     let DriveTask {
+        notes,
         audit,
         pool,
         run_id,
@@ -418,6 +424,7 @@ async fn drive_run(task: DriveTask) -> Result<(), AcpRunJoinError> {
             context_hash.clone(),
         );
         run_reusable_turn(ReusableTurn {
+            notes,
             key,
             owner_id,
             agent_id: agent_id.clone(),
@@ -438,6 +445,7 @@ async fn drive_run(task: DriveTask) -> Result<(), AcpRunJoinError> {
         .await
     } else {
         run_one_shot_turn(
+            notes,
             &config,
             &cwd,
             &prompt,
@@ -511,6 +519,7 @@ async fn drive_run(task: DriveTask) -> Result<(), AcpRunJoinError> {
 /// return the turn outcome.
 #[allow(clippy::too_many_arguments)]
 async fn run_one_shot_turn(
+    notes: Option<notes_mcp::NotesContext>,
     config: &AcpRuntimeConfig,
     cwd: &Path,
     prompt: &str,
@@ -525,6 +534,13 @@ async fn run_one_shot_turn(
         Err(message) => return failed_outcome(message),
     };
     let cwd_string = cwd.to_string_lossy().to_string();
+    let notes_lease = match session.activate_notes(notes).await {
+        Ok(lease) => lease,
+        Err(message) => {
+            let _ = terminate_live_session(&mut session).await;
+            return failed_outcome(message);
+        }
+    };
     let phase = drive_new_session_prompt(
         session.conn(),
         &cwd_string,
@@ -537,6 +553,7 @@ async fn run_one_shot_turn(
     )
     .await;
 
+    drop(notes_lease);
     let (status, error_message, was_cancelled, completed_cleanly) = phase_status(phase, config);
 
     finish_session(&mut session, status, completed_cleanly)
@@ -564,6 +581,7 @@ fn reusable_session_key(
 }
 
 struct ReusableTurn {
+    notes: Option<notes_mcp::NotesContext>,
     key: ReusableSessionKey,
     owner_id: String,
     agent_id: String,
@@ -735,6 +753,22 @@ async fn run_reusable_turn(turn: ReusableTurn) -> TurnOutcome {
         session.conn().set_events_tx(turn.events_tx.clone()).await;
     }
 
+    let notes_lease = match managed
+        .session
+        .as_mut()
+        .expect("managed session present")
+        .activate_notes(turn.notes)
+        .await
+    {
+        Ok(lease) => lease,
+        Err(message) => {
+            if let Some(mut session) = managed.session.take() {
+                let _ = terminate_live_session(&mut session).await;
+            }
+            managed.initialized = false;
+            return failed_outcome(message);
+        }
+    };
     let was_initialized = managed.initialized;
     let cwd_string = turn.cwd.to_string_lossy().to_string();
     // Only asked when this process has no live session for the key: that is
@@ -798,6 +832,8 @@ async fn run_reusable_turn(turn: ReusableTurn) -> TurnOutcome {
             .await
         }
     };
+    // Revoke even when the CLI stays alive for an incremental next turn.
+    drop(notes_lease);
     if !was_initialized {
         if let Phase::Done(Ok(outcome)) = &phase {
             if outcome.stop_reason != "cancelled" {
@@ -844,6 +880,7 @@ async fn run_reusable_turn(turn: ReusableTurn) -> TurnOutcome {
 }
 
 struct LiveAcpSession {
+    notes_bridge: Option<notes_mcp::NotesBridge>,
     child: Child,
     conn: Option<AcpConnection>,
     stderr_task: Option<JoinHandle<String>>,
@@ -887,6 +924,7 @@ impl LiveAcpSession {
 
         let conn = AcpConnection::spawn(stdin, stdout, config.permission_policy, events_tx, None);
         Ok(Self {
+            notes_bridge: None,
             child,
             conn: Some(conn),
             stderr_task: Some(stderr_task),
@@ -894,6 +932,26 @@ impl LiveAcpSession {
             session_id: String::new(),
             supports_prompt_images: false,
         })
+    }
+
+    async fn activate_notes(
+        &mut self,
+        notes: Option<notes_mcp::NotesContext>,
+    ) -> Result<Option<notes_mcp::NotesLease>, String> {
+        let Some(notes) = notes else {
+            self.conn
+                .as_mut()
+                .expect("live connection")
+                .mcp_servers
+                .clear();
+            return Ok(None);
+        };
+        if self.notes_bridge.is_none() {
+            self.notes_bridge = Some(notes_mcp::NotesBridge::start().await?);
+        }
+        let bridge = self.notes_bridge.as_ref().expect("notes bridge present");
+        self.conn.as_mut().expect("live connection").mcp_servers = vec![bridge.server_config()?];
+        Ok(Some(bridge.activate(notes)))
     }
 
     fn conn(&self) -> &AcpConnection {
@@ -1086,7 +1144,7 @@ async fn open_new_session(
     config: &AcpRuntimeConfig,
     store: Option<&AcpSessionStore>,
 ) -> Result<String, ProtocolError> {
-    let mut new_params = json!({ "cwd": cwd, "mcpServers": [] });
+    let mut new_params = json!({ "cwd": cwd, "mcpServers": conn.mcp_servers });
     if let Some(meta) = new_session_meta(config) {
         new_params["_meta"] = meta;
     }
@@ -1122,7 +1180,8 @@ async fn load_stored_session(
     config: &AcpRuntimeConfig,
     events_tx: &mpsc::UnboundedSender<AcpAgentEvent>,
 ) -> Result<(), ProtocolError> {
-    let mut load_params = json!({ "sessionId": session_id, "cwd": cwd, "mcpServers": [] });
+    let mut load_params =
+        json!({ "sessionId": session_id, "cwd": cwd, "mcpServers": conn.mcp_servers });
     if let Some(meta) = new_session_meta(config) {
         load_params["_meta"] = meta;
     }

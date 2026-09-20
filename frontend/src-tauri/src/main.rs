@@ -1049,6 +1049,7 @@ fn restore_desktop_shell_path() {
 fn restore_desktop_shell_path() {}
 
 fn main() {
+    qunica_backend::acp::notes_mcp::run_stdio_if_requested();
     // Keep this before Tauri starts worker threads: process environment changes
     // are global, and the in-process backend inherits this PATH.
     restore_desktop_shell_path();

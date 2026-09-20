@@ -23,6 +23,12 @@ Qunica detects and launches these CLIs; it does not manage their accounts. Insta
 - **timeout_seconds** — how long one run may take.
 - **permission_policy** — how to answer the CLI's permission prompts.
 
+## Shared group notes
+
+In groups with a local workspace, Qunica automatically supplies the `qunica-group-notes` stdio MCP server on ACP `session/new` and `session/load`. It provides `ReadGroupNotes`, `CreateGroupNote` and `EditGroupNote`; the CLI may prefix the tool names. No user MCP configuration or additional interpreter is needed. Notes stay in the group's bound workspace even if the agent runs in an independent workspace or task worktree. See [Shared notes](groups.md#shared-notes) for arguments and lifecycle guarantees.
+
+The executable's internal `--qunica-group-notes-mcp` mode runs only the stdio relay, before UI or backend startup. A session-owned loopback broker holds host authority; the relay receives an opaque capability via its MCP environment, not an account credential or database path. Operations are permitted only during the current dispatch. This preserves reusable ACP sessions without giving idle CLI processes continuing access to notes. Runtime adapters that ignore `mcpServers` do not gain these tools merely from the host prompt.
+
 ## Auditing
 
 Every external run records its command, working directory, status, exit code, and the tail of stdout/stderr, so a failure can be diagnosed without rerunning it.

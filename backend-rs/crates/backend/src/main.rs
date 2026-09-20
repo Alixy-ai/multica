@@ -1,8 +1,13 @@
 use anyhow::Context;
 use qunica_backend::{config::AppConfig, server, telemetry};
 
+fn main() -> anyhow::Result<()> {
+    qunica_backend::acp::notes_mcp::run_stdio_if_requested();
+    run()
+}
+
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn run() -> anyhow::Result<()> {
     let config = AppConfig::from_env_and_args()?;
     telemetry::setup_tracing(&config).context("failed to initialize tracing")?;
     server::serve(config.into()).await?;
