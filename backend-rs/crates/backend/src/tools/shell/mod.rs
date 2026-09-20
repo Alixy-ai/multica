@@ -40,6 +40,7 @@ use self::{
 };
 
 use super::{controlled, ApprovalGrants, ApprovalRequest, ToolError, ToolResult};
+use crate::decision::{self, DecisionGate};
 
 /// Default command timeout when the caller does not specify one.
 pub const DEFAULT_SHELL_TIMEOUT_SECONDS: u64 = 600;
@@ -91,6 +92,38 @@ pub async fn run_shell(
     run_in_background: bool,
     grants: &ApprovalGrants,
 ) -> Result<ToolResult, ToolError> {
+    run_shell_reviewed(
+        shell,
+        tool_name,
+        root,
+        command,
+        timeout_seconds,
+        run_in_background,
+        grants,
+        None,
+    )
+    .await
+}
+
+/// [`run_shell`] with a second opinion from the decision model.
+///
+/// The regex policy runs first and keeps the last word on what is refused or
+/// asked about. Only a command the policy allowed is shown to `decision`, and
+/// the model can only escalate it to an approval card under
+/// [`decision::SHELL_RISK_RULE`]; it never lets through what the policy would
+/// have stopped. A remembered grant for that rule, or unattended mode, skips
+/// the second opinion the same way it skips the first.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_shell_reviewed(
+    shell: &ResolvedShell,
+    tool_name: &str,
+    root: &Path,
+    command: &str,
+    timeout_seconds: u64,
+    run_in_background: bool,
+    grants: &ApprovalGrants,
+    decision: Option<&DecisionGate>,
+) -> Result<ToolResult, ToolError> {
     if !(1..=MAX_SHELL_TIMEOUT_SECONDS).contains(&timeout_seconds) {
         return Err(ToolError::invalid(format!(
             "timeout_seconds must be between 1 and {MAX_SHELL_TIMEOUT_SECONDS} when provided"
@@ -123,6 +156,24 @@ pub async fn run_shell(
                     tool_name: tool_name.to_string(),
                     subject: command.to_string(),
                 }))
+            }
+        }
+        // Note: the decision model is consulted after the policy, never
+        // instead of it. The policy is a fixed list that cannot see through
+        // `python -c` or a package script; the model can, but it can also be
+        // talked into anything by the text it is judging. Letting it only
+        // raise the bar keeps the worst case at "asked once too often".
+        if let Some(gate) = decision.filter(|_| !grants.contains(decision::SHELL_RISK_RULE)) {
+            if let Some(detail) =
+                decision::shell_risk_detail(gate, command, shell.dialect.label(), root).await
+            {
+                return Ok(controlled::approval_required(ApprovalRequest {
+                    rule: decision::SHELL_RISK_RULE.to_string(),
+                    capability: "run a command the decision model rated as risky".to_string(),
+                    reason: detail,
+                    tool_name: tool_name.to_string(),
+                    subject: command.to_string(),
+                }));
             }
         }
     }

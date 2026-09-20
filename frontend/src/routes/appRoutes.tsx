@@ -65,6 +65,9 @@ const SystemSettingsPage = lazy(() =>
 const MediaSettingsPage = lazy(() =>
   import('@/pages/settings/MediaSettingsPage').then((m) => ({ default: m.MediaSettingsPage })),
 )
+const DecisionSettingsPage = lazy(() =>
+  import('@/pages/settings/DecisionSettingsPage').then((m) => ({ default: m.DecisionSettingsPage })),
+)
 const AppActionsPage = lazy(() =>
   import('@/pages/settings/AppActionsPage').then((m) => ({ default: m.AppActionsPage })),
 )
@@ -154,6 +157,7 @@ export const appChildren: RouteObject[] = [
       { index: true, element: <OverlayRedirect to="/settings/system" /> },
       { path: 'system', element: <SystemSettingsPage /> },
       { path: 'media', element: <MediaSettingsPage /> },
+      { path: 'decision', element: <DecisionSettingsPage /> },
       { path: 'logs', element: <SystemLogsPage /> },
       { path: 'assistant-actions', element: <AppActionsPage /> },
     ],

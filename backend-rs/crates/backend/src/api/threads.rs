@@ -65,6 +65,11 @@ pub struct CreateTaskThreadRequest {
     git_branch: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct RenameTaskThreadRequest {
+    title: String,
+}
+
 #[derive(Debug, Serialize)]
 pub struct ClearTaskMessagesResponse {
     cleared_count: u64,
@@ -264,6 +269,37 @@ pub async fn create_group(
 
     let thread = fetch_owned_thread(state.db.pool(), &id, &owner_id).await?;
     Ok((StatusCode::CREATED, Json(ThreadResponse::from(thread))))
+}
+
+pub async fn rename(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(thread_id): Path<String>,
+    Json(body): Json<RenameTaskThreadRequest>,
+) -> Result<Json<ThreadResponse>, ApiError> {
+    let owner_id = current_user_id(&headers, &state.auth.secret_key)?;
+    let thread_id = validate_uuid(&thread_id, "thread id")?;
+    let thread = fetch_owned_thread(state.db.pool(), &thread_id, &owner_id).await?;
+    ensure_task_thread(&thread)?;
+    let title = validate_title(&body.title)?;
+
+    // Note: A title is metadata, so active and archived tasks can be renamed
+    // without changing their execution state, messages, or worktree binding.
+    let updated = sqlx::query(
+        "UPDATE threads SET title = ?, updated_at = ? WHERE id = ? AND status != 'cleared'",
+    )
+    .bind(title)
+    .bind(now_rfc3339())
+    .bind(&thread_id)
+    .execute(state.db.pool())
+    .await
+    .map_err(|_| ApiError::internal("failed to rename task"))?;
+    if updated.rows_affected() == 0 {
+        return Err(ApiError::not_found("task not found"));
+    }
+
+    let thread = fetch_owned_thread(state.db.pool(), &thread_id, &owner_id).await?;
+    Ok(Json(ThreadResponse::from(thread)))
 }
 
 pub async fn archive(

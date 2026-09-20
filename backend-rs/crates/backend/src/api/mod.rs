@@ -239,6 +239,10 @@ pub fn router(state: AppState) -> Router {
             get(system_settings::get).patch(system_settings::update),
         )
         .route(
+            "/api/v2/settings/decision/test",
+            axum::routing::post(system_settings::test_decision),
+        )
+        .route(
             "/api/v2/groups",
             axum::routing::post(groups::create).get(groups::list),
         )
@@ -577,7 +581,9 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/api/v2/threads/:thread_id",
-            get(threads::get).delete(threads::delete),
+            get(threads::get)
+                .patch(threads::rename)
+                .delete(threads::delete),
         )
         .route(
             "/api/v2/threads/:thread_id/cancel",

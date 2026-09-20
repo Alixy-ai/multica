@@ -62,6 +62,8 @@ Codex CLI and Claude Code may create their own native subagents inside an ACP ru
 
 `Bash` reviews each command before running it. Destructive but legitimate work — deleting files, `git reset --hard`, `git clean`, a force-push, writing outside the workspace — pauses the turn and shows an approval card. Approving with **remember** grants that rule for the rest of the thread. A second class of command (formatting a volume, powering off the host, `dd of=`) is refused outright, with no approval offered.
 
+With the [decision model](settings.md#decision-model) scenario `shell_risk` switched on for the group, a command the fixed review allowed gets a second opinion: the model scores how destructive it is and whether it deletes files, writes outside the workspace, or discards git work. A risky score shows an approval card under the rule `decision-risk`, which **remember** grants like any other. The model can only add a card, never remove one, and the fixed review keeps the last word on what is refused.
+
 **Unattended mode** (`bypass_approvals` in `tool_config`) turns the whole review off: nothing pauses, and the refused class runs too. It is the equivalent of Codex YOLO mode or Claude Code's `--dangerously-skip-permissions`, and it is off for every agent that does not explicitly ask for it. Only enable it for an agent you trust in a workspace you can afford to lose.
 
 ## Vision

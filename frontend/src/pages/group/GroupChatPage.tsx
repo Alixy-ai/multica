@@ -136,11 +136,19 @@ export function GroupChatPage() {
             )
             selectThread(next?.id ?? archivedId)
           }}
-          onDeleted={(deletedId) => {
-            const remaining = threads.filter((thread) => thread.id !== deletedId)
+          onDeleted={(deletedId, deletedIds = [deletedId]) => {
+            const remaining = threads.filter((thread) => !deletedIds.includes(thread.id))
             const next = remaining.find((thread) => thread.status !== 'archived')
               ?? remaining[0]
             if (next) selectThread(next.id)
+            else {
+              setSelection({ groupId, threadId: undefined })
+              try {
+                window.localStorage.removeItem(`${SELECTED_THREAD_STORAGE_PREFIX}${groupId}`)
+              } catch {
+                // Clearing stale selection must not block task deletion.
+              }
+            }
           }}
         />
       )}

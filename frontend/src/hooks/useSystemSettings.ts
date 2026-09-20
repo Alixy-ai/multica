@@ -2,7 +2,12 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { fetchJson } from '@/lib/api-v2/client'
 import { useAuthStore } from '@/stores/authStore'
-import type { SystemSettingsRead, SystemSettingsUpdate } from '@/types/api'
+import type {
+  DecisionTestRequest,
+  DecisionTestResponse,
+  SystemSettingsRead,
+  SystemSettingsUpdate,
+} from '@/types/api'
 
 export function useSystemSettings() {
   const token = useAuthStore((s) => s.token)
@@ -26,5 +31,18 @@ export function useUpdateSystemSettings() {
     onSuccess: (updated) => {
       qc.setQueryData(['settings', 'system'], updated)
     },
+  })
+}
+
+/** Send one sample question to the decision endpoint and report the answer. */
+export function useTestDecisionEndpoint() {
+  const token = useAuthStore((s) => s.token)
+  return useMutation({
+    mutationFn: (data: DecisionTestRequest) =>
+      fetchJson<DecisionTestResponse>('/settings/decision/test', {
+        token,
+        method: 'POST',
+        body: data,
+      }),
   })
 }

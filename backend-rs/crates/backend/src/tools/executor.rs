@@ -15,6 +15,7 @@ use std::{
 
 use serde_json::Value;
 
+use crate::decision::{self, DecisionGate, DecisionScenario};
 use crate::mcp::{is_mcp_tool_name, McpManager, McpServerConfig, McpToolBinding};
 
 use super::{
@@ -41,6 +42,9 @@ pub struct McpMount {
     bindings: HashMap<String, McpToolBinding>,
     /// Server id → the config to connect with.
     servers: HashMap<String, McpServerConfig>,
+    /// Server id → the operator's description of the server, for prompts that
+    /// have to say what a server is for without listing every tool.
+    server_descriptions: HashMap<String, String>,
     /// `(server name, reason)` for each server that failed to list its tools.
     failures: Vec<(String, String)>,
 }
@@ -92,8 +96,48 @@ impl McpMount {
         Self {
             bindings: resolved,
             servers,
+            server_descriptions: HashMap::new(),
             failures,
         }
+    }
+
+    /// Attach the operator's descriptions, keyed by server id.
+    pub fn with_server_descriptions(
+        mut self,
+        descriptions: impl IntoIterator<Item = (String, String)>,
+    ) -> Self {
+        self.server_descriptions = descriptions
+            .into_iter()
+            .filter(|(_, description)| !description.trim().is_empty())
+            .collect();
+        self
+    }
+
+    /// The mounted servers as `(name, what it is for)`, one per server that
+    /// contributed at least one tool. A server without a description is
+    /// summarised by its tool names, so the reader still learns what it does.
+    pub fn server_summaries(&self) -> Vec<(String, String)> {
+        let mut by_server: HashMap<&str, Vec<&str>> = HashMap::new();
+        for binding in self.bindings.values() {
+            by_server
+                .entry(binding.server_id.as_str())
+                .or_default()
+                .push(binding.tool_name.as_str());
+        }
+        let mut summaries: Vec<(String, String)> = by_server
+            .into_iter()
+            .filter_map(|(server_id, mut tools)| {
+                let config = self.servers.get(server_id)?;
+                tools.sort_unstable();
+                let description = match self.server_descriptions.get(server_id) {
+                    Some(description) => description.clone(),
+                    None => format!("tools: {}", tools.join(", ")),
+                };
+                Some((config.name.clone(), description))
+            })
+            .collect();
+        summaries.sort();
+        summaries
     }
 
     /// Whether this mount contributes nothing at all — no tools and no failure
@@ -139,6 +183,10 @@ pub struct ToolExecutor {
     /// The interpreter shell commands run under. Defaults to whatever the host
     /// offers, and follows the account's preference once one is bound.
     shell: &'static ResolvedShell,
+    /// The decision model, when the owner enabled it. Consulted for the tool
+    /// scenarios it has switched on: a second opinion on shell commands and a
+    /// check on group-note status changes.
+    decision: Option<DecisionGate>,
 }
 
 // `McpManager` holds live connections and so cannot derive `Debug`; the rest of
@@ -159,6 +207,7 @@ impl std::fmt::Debug for ToolExecutor {
             .field("app_control", &self.app_control.is_some())
             .field("approvals", &self.approvals)
             .field("shell", &self.shell.program)
+            .field("decision_configured", &self.decision.is_some())
             .finish()
     }
 }
@@ -202,6 +251,7 @@ impl ToolExecutor {
             app_control: None,
             approvals: ApprovalGrants::default(),
             shell: process_shell(),
+            decision: None,
         })
     }
 
@@ -223,7 +273,19 @@ impl ToolExecutor {
             app_control: None,
             approvals: ApprovalGrants::default(),
             shell: process_shell(),
+            decision: None,
         }
+    }
+
+    /// Consult the decision model for the tool scenarios it has enabled.
+    pub fn with_decision(mut self, decision: Option<DecisionGate>) -> Self {
+        self.decision = decision;
+        self
+    }
+
+    /// The decision gate, when one is bound and has `scenario` switched on.
+    fn decision_for(&self, scenario: DecisionScenario) -> Option<&DecisionGate> {
+        self.decision.as_ref().filter(|gate| gate.enabled(scenario))
     }
 
     /// Mount MCP tools, routed through `manager`'s connection pool.
@@ -353,6 +415,25 @@ impl ToolExecutor {
                     run_blocking(move || notes.read(&path, 1, MAX_READ_LINES)).await
                 } else {
                     let edits = arg_file_edits(&args)?;
+                    if let Some(gate) = self.decision_for(DecisionScenario::NoteValidation) {
+                        let preview = {
+                            let notes = notes.clone();
+                            let path = path.clone();
+                            let edits = edits.clone();
+                            run_blocking(move || {
+                                notes.preview_edit(&path, &edits).map(ToolResult::completed)
+                            })
+                            .await?
+                        };
+                        if let Some(reason) =
+                            decision::validate_note_edit(gate, &preview.output).await
+                        {
+                            return Ok(ToolResult {
+                                status: ToolStatus::Failed,
+                                output: reason,
+                            });
+                        }
+                    }
                     run_blocking(move || notes.edit(&path, &edits)).await
                 }
             }
@@ -528,7 +609,7 @@ impl ToolExecutor {
                     shell::DEFAULT_SHELL_TIMEOUT_SECONDS,
                 );
                 let run_in_background = arg_bool(&args, "run_in_background", false);
-                shell::run_shell(
+                shell::run_shell_reviewed(
                     self.shell,
                     name,
                     workspace.root(),
@@ -536,6 +617,7 @@ impl ToolExecutor {
                     timeout_seconds,
                     run_in_background,
                     &self.approvals,
+                    self.decision_for(DecisionScenario::ShellRisk),
                 )
                 .await
             }

@@ -27,6 +27,7 @@ vi.mock('@/hooks/useGroupThreads', () => ({
   useArchiveGroupThread: () => idle,
   useRestoreGroupThread: () => idle,
   useDeleteGroupThread: () => idle,
+  useRenameGroupThread: () => idle,
 }))
 vi.mock('@/hooks/useGroupMessages', () => ({
   useClearGroupThreadMessages: () => idle,
@@ -60,15 +61,15 @@ function thread(id: string, title: string): GroupThread {
 
 const threads = [thread('thread-1', 'Ship the API'), thread('thread-2', 'Write the docs')]
 
-function renderSwitcher() {
+function renderSwitcher(options: { tasks?: GroupThread[]; selected?: GroupThread; onSelect?: (id: string) => void; onDeleted?: (id: string) => void } = {}) {
   return render(
     <GroupChatHeaderActions
       groupId="group-1"
-      threads={threads}
-      selectedThread={threads[0]}
-      onSelect={vi.fn()}
+      threads={options.tasks ?? threads}
+      selectedThread={options.selected ?? threads[0]}
+      onSelect={options.onSelect ?? vi.fn()}
       onArchived={vi.fn()}
-      onDeleted={vi.fn()}
+      onDeleted={options.onDeleted ?? vi.fn()}
     />,
   )
 }
@@ -85,7 +86,7 @@ function startRun(id: string, threadId: string) {
 async function openSwitcher() {
   const user = userEvent.setup()
   renderSwitcher()
-  await user.click(screen.getByRole('combobox', { name: 'Current task' }))
+  await user.click(screen.getByRole('button', { name: 'Current task' }))
 }
 
 describe('GroupChatHeaderActions task status', () => {
@@ -105,7 +106,7 @@ describe('GroupChatHeaderActions task status', () => {
 
     renderSwitcher()
 
-    expect(screen.getByRole('combobox', { name: 'Current task' })).toHaveTextContent(
+    expect(screen.getByRole('button', { name: 'Current task' })).toHaveTextContent(
       'Replying',
     )
   })
@@ -117,7 +118,7 @@ describe('GroupChatHeaderActions task status', () => {
 
     await openSwitcher()
 
-    const options = await screen.findAllByRole('option')
+    const options = within(screen.getByRole('group', { name: 'Active' })).getAllByRole('button').filter((button) => button.hasAttribute('aria-pressed'))
     const names = options.map((option) => option.textContent)
     expect(names).toEqual(['ReplyingShip the API', 'Waiting for youWrite the docs'])
   })
@@ -125,7 +126,7 @@ describe('GroupChatHeaderActions task status', () => {
   it('says nothing about a task that is not doing anything', async () => {
     await openSwitcher()
 
-    const options = await screen.findAllByRole('option')
+    const options = within(screen.getByRole('group', { name: 'Active' })).getAllByRole('button').filter((button) => button.hasAttribute('aria-pressed'))
     expect(options.map((option) => option.textContent)).toEqual([
       'Ship the API',
       'Write the docs',
@@ -141,5 +142,93 @@ describe('GroupChatHeaderActions task status', () => {
     await user.click(within(dialog).getByRole('button', { name: 'Clear current task' }))
 
     expect(idle.mutateAsync).toHaveBeenCalledWith('thread-1')
+  })
+
+  it('renames an archived row without selecting it and trims the title', async () => {
+    const user = userEvent.setup()
+    const archived = { ...thread('old', 'Old task'), status: 'archived' }
+    const onSelect = vi.fn()
+    renderSwitcher({ tasks: [...threads, archived], onSelect })
+    await user.click(screen.getByRole('button', { name: 'Current task' }))
+    await user.click(screen.getByRole('button', { name: 'Rename “Old task”' }))
+    const field = screen.getByRole('textbox', { name: 'Task title' })
+    expect(field).toHaveValue('Old task')
+    await user.clear(field)
+    await user.type(field, '   ')
+    expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled()
+    await user.clear(field)
+    await user.type(field, '  Better title  ')
+    await user.keyboard('{Enter}')
+    expect(idle.mutateAsync).toHaveBeenCalledWith({ threadId: 'old', title: 'Better title' })
+    expect(onSelect).not.toHaveBeenCalled()
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+  })
+
+  it('preserves the entered name on failure so it can be retried', async () => {
+    const user = userEvent.setup()
+    idle.mutateAsync.mockRejectedValueOnce(new Error('Offline'))
+    renderSwitcher()
+    await user.click(screen.getByRole('button', { name: 'Rename task' }))
+    const field = screen.getByRole('textbox', { name: 'Task title' })
+    await user.clear(field)
+    await user.type(field, 'New name{Enter}')
+    expect(field).toHaveValue('New name')
+    expect(screen.getByRole('dialog')).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Save' }))
+    expect(idle.mutateAsync).toHaveBeenCalledTimes(2)
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+  })
+
+  it('deletes an archived row after confirmation without switching the current task', async () => {
+    const user = userEvent.setup()
+    const archived = { ...thread('old', 'Old task'), status: 'archived' }
+    const onSelect = vi.fn()
+    const onDeleted = vi.fn()
+    renderSwitcher({ tasks: [...threads, archived], onSelect, onDeleted })
+    await user.click(screen.getByRole('button', { name: 'Current task' }))
+    await user.click(screen.getByRole('button', { name: 'Delete “Old task”' }))
+    expect(idle.mutateAsync).not.toHaveBeenCalled()
+    const dialog = screen.getByRole('alertdialog')
+    expect(dialog).toHaveTextContent('Delete “Old task”?')
+    await user.click(within(dialog).getByRole('button', { name: 'Delete task' }))
+    expect(idle.mutateAsync).toHaveBeenCalledWith('old')
+    expect(onSelect).not.toHaveBeenCalled()
+    expect(onDeleted).not.toHaveBeenCalled()
+  })
+
+  it('deletes only archived tasks, keeps the current task last, and retries unfinished targets', async () => {
+    const user = userEvent.setup()
+    const first = { ...thread('old-1', 'First old task'), status: 'archived' }
+    const second = { ...thread('old-2', 'Second old task'), status: 'archived' }
+    const selected = { ...thread('selected', 'Selected old task'), status: 'archived' }
+    const onDeleted = vi.fn()
+    idle.mutateAsync.mockResolvedValueOnce({}).mockRejectedValueOnce(new Error('Offline'))
+    renderSwitcher({ tasks: [selected, ...threads, first, second], selected, onDeleted })
+    await user.click(screen.getByRole('button', { name: 'Current task' }))
+    await user.click(screen.getByRole('button', { name: 'Delete all archived' }))
+    expect(screen.getByRole('alertdialog')).toHaveTextContent('Delete 3 archived tasks?')
+    await user.click(screen.getByRole('button', { name: 'Delete all archived' }))
+    expect(screen.getByRole('alert')).toHaveTextContent('Offline')
+    expect(onDeleted).not.toHaveBeenCalled()
+    await user.click(screen.getByRole('button', { name: 'Delete all archived' }))
+    expect(idle.mutateAsync.mock.calls.map(([id]) => id)).toEqual(['old-1', 'old-2', 'old-2', 'selected'])
+    expect(onDeleted).toHaveBeenCalledExactlyOnceWith('selected', ['old-2', 'selected'])
+    expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument()
+  })
+
+  it('allows keyboard task selection and leaves cancellation without mutations', async () => {
+    const user = userEvent.setup()
+    const onSelect = vi.fn()
+    renderSwitcher({ onSelect })
+    const trigger = screen.getByRole('button', { name: 'Current task' })
+    trigger.focus()
+    await user.keyboard('{Enter}')
+    const option = screen.getByRole('button', { name: 'Write the docs' })
+    option.focus()
+    await user.keyboard('{Enter}')
+    expect(onSelect).toHaveBeenCalledWith('thread-2')
+    await user.click(screen.getByRole('button', { name: 'Rename task' }))
+    await user.click(screen.getByRole('button', { name: 'Cancel' }))
+    expect(idle.mutateAsync).not.toHaveBeenCalled()
   })
 })

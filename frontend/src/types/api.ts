@@ -4,7 +4,12 @@
  * contracts until a Rust schema generation flow is introduced.
  */
 
-import type { GroupSchedulerConfig, GroupTurnSummary } from '@/lib/api-v2/types'
+import type {
+  DecisionScenarios,
+  GroupDecisionConfig,
+  GroupSchedulerConfig,
+  GroupTurnSummary,
+} from '@/lib/api-v2/types'
 
 export interface UserRead {
   id: string
@@ -567,7 +572,7 @@ export interface GroupAvatarMemberRead {
   avatar_url?: string | null
 }
 
-export interface GroupRead extends GroupSchedulerConfig {
+export interface GroupRead extends GroupSchedulerConfig, GroupDecisionConfig {
   id: string
   workspace_id: string | null
   auto_share_workspace_with_new_agents?: boolean
@@ -627,9 +632,11 @@ export interface GroupCreate extends Partial<GroupSchedulerConfig> {
   agent_free_mention_max_dispatches?: number
   communication_mode?: GroupCommunicationMode
   initial_agents?: string[]
+  decision_enabled?: boolean
+  decision_scenarios?: Partial<DecisionScenarios>
 }
 
-export interface GroupTemplateConfig extends GroupSchedulerConfig {
+export interface GroupTemplateConfig extends GroupSchedulerConfig, GroupDecisionConfig {
   description: string | null
   announcement: string | null
   auto_share_workspace_with_new_agents: boolean
@@ -662,6 +669,9 @@ export interface GroupUpdate extends Partial<GroupSchedulerConfig> {
   agent_free_mention_max_dispatches?: number
   communication_mode?: GroupCommunicationMode
   default_speaking_order?: string[] | null
+  decision_enabled?: boolean
+  /** A partial object updates only the named scenarios; `null` turns all off. */
+  decision_scenarios?: Partial<DecisionScenarios> | null
 }
 
 export interface GroupMemberRead {
@@ -773,6 +783,26 @@ export type Language = 'zh-CN' | 'en-US'
  */
 export type ReplyInsertMode = 'instant' | 'queue'
 
+export type { DecisionScenarioKey, DecisionScenarios } from '@/lib/api-v2/types'
+
+export interface DecisionTestRequest {
+  endpoint?: string | null
+  api_key?: string | null
+  model?: string | null
+}
+
+/** Which wire protocol the decision endpoint URL selected. */
+export type DecisionDialect = 'system_one' | 'ai_sdk_gateway'
+
+export interface DecisionTestResponse {
+  ok: boolean
+  model: string | null
+  sample_probability: number | null
+  input_tokens: number | null
+  message: string
+  dialect: DecisionDialect
+}
+
 export interface SystemSettingsRead {
   id: string
   owner_id: string
@@ -799,6 +829,10 @@ export interface SystemSettingsRead {
   video_generation_endpoint: string
   video_status_endpoint: string
   video_content_endpoint: string
+  decision_endpoint: string
+  decision_api_key_configured: boolean
+  decision_model: string
+  decision_min_confidence: number
   created_at: string
   updated_at: string
 }
@@ -827,6 +861,10 @@ export interface SystemSettingsUpdate {
   video_generation_endpoint?: string | null
   video_status_endpoint?: string | null
   video_content_endpoint?: string | null
+  decision_endpoint?: string | null
+  decision_api_key?: string | null
+  decision_model?: string | null
+  decision_min_confidence?: number | null
 }
 
 export type SenderType = 'user' | 'agent' | 'system'

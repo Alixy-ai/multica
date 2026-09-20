@@ -36,6 +36,9 @@ pub enum SelectionReason {
     DeterministicOrder,
     Moderator,
     ModeratorFallback,
+    /// The configured decision model picked the speaker in place of the
+    /// moderator's chat model.
+    DecisionModel,
 }
 
 impl SelectionReason {
@@ -48,6 +51,7 @@ impl SelectionReason {
             Self::DeterministicOrder => "deterministic_order",
             Self::Moderator => "moderator",
             Self::ModeratorFallback => "moderator_fallback",
+            Self::DecisionModel => "decision_model",
         }
     }
 }
@@ -64,6 +68,7 @@ impl TryFrom<&str> for SelectionReason {
             "deterministic_order" => Ok(Self::DeterministicOrder),
             "moderator" => Ok(Self::Moderator),
             "moderator_fallback" => Ok(Self::ModeratorFallback),
+            "decision_model" => Ok(Self::DecisionModel),
             other => Err(SchedulerModelError::UnknownSelectionReason(
                 other.to_owned(),
             )),

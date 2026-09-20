@@ -68,6 +68,10 @@ const SETTINGS: SystemSettingsRead = {
   video_generation_endpoint: '/v1/videos',
   video_status_endpoint: '/v1/videos/{id}',
   video_content_endpoint: '/v1/videos/{id}/content',
+  decision_endpoint: 'https://openrouter.ai/api/alpha/decisions',
+  decision_api_key_configured: false,
+  decision_model: '~typesafe/jev-latest',
+  decision_min_confidence: 0.7,
   created_at: '2026-08-29T00:00:00Z',
   updated_at: '2026-08-29T00:00:00Z',
 }

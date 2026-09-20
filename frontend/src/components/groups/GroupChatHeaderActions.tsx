@@ -1,11 +1,11 @@
 import { CompactActions } from '@/components/layout/CompactActions'
 import { useState, type FormEvent } from 'react'
-import { Archive, ArchiveRestore, ChevronRight, Eraser, ListPlus, Trash2 } from 'lucide-react'
+import { Archive, ArchiveRestore, ChevronRight, Eraser, ListPlus, Pencil, Trash2 } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 
 import { Button } from '@/components/ui/button'
 import { ConfirmDialog } from '@/components/ui/confirm-dialog'
-import { ThreadStatusIndicator } from '@/components/chat/ConversationStatusDot'
+import { GroupTaskSwitcher } from '@/components/groups/GroupTaskSwitcher'
 import {
   Dialog,
   DialogClose,
@@ -18,17 +18,7 @@ import {
 } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
-import {
-  Select,
-  SelectContent,
-  SelectGroup,
-  SelectItem,
-  SelectLabel,
-  SelectSeparator,
-  SelectTrigger,
-  SelectValue,
-} from '@/components/ui/select'
-import { useArchiveGroupThread, useCreateGroupThread, useDeleteGroupThread, useRestoreGroupThread } from '@/hooks/useGroupThreads'
+import { useArchiveGroupThread, useCreateGroupThread, useDeleteGroupThread, useRenameGroupThread, useRestoreGroupThread } from '@/hooks/useGroupThreads'
 import { useGroupWorkspaceGitBranches } from '@/hooks/useWorkspaceGit'
 import { useClearGroupThreadMessages, useConversationPrefetch } from '@/hooks/useGroupMessages'
 import type { GroupThread } from '@/types/api'
@@ -39,7 +29,7 @@ interface GroupChatHeaderActionsProps {
   selectedThread: GroupThread | undefined
   onSelect: (threadId: string) => void
   onArchived: (threadId: string) => void
-  onDeleted: (threadId: string) => void
+  onDeleted: (threadId: string, deletedIds?: string[]) => void
   disabled?: boolean
 }
 
@@ -57,24 +47,23 @@ export function GroupChatHeaderActions({
   const archiveThread = useArchiveGroupThread(groupId)
   const restoreThread = useRestoreGroupThread(groupId)
   const deleteThread = useDeleteGroupThread(groupId)
+  const renameThread = useRenameGroupThread(groupId)
   const clearThread = useClearGroupThreadMessages(groupId)
   const prefetchConversation = useConversationPrefetch()
   const [createOpen, setCreateOpen] = useState(false)
   const [archiveOpen, setArchiveOpen] = useState(false)
   const [deleteOpen, setDeleteOpen] = useState(false)
+  const [deleteTargets, setDeleteTargets] = useState<GroupThread[]>([])
+  const [deleteBulk, setDeleteBulk] = useState(false)
+  const [deleting, setDeleting] = useState(false)
+  const [renameTarget, setRenameTarget] = useState<GroupThread | null>(null)
+  const [renameTitle, setRenameTitle] = useState('')
   const [clearOpen, setClearOpen] = useState(false)
   const [title, setTitle] = useState('')
   const [gitBranch, setGitBranch] = useState('')
   const gitBranches = useGroupWorkspaceGitBranches(createOpen ? groupId : undefined)
-  const activeThreads = threads.filter((thread) => thread.status !== 'archived')
-  const archivedThreads = threads.filter((thread) => thread.status === 'archived')
   const selectedArchived = selectedThread?.status === 'archived'
   const displayTitle = (thread: GroupThread) => thread.title || t('tasks.untitled')
-  const displayLabel = (thread: GroupThread, archived = false) => [
-    displayTitle(thread),
-    thread.git_branch,
-    archived ? t('tasks.archived') : null,
-  ].filter(Boolean).join(' · ')
   const boundBranches = new Set(threads.map((thread) => thread.git_branch).filter(Boolean))
   const availableBranches = (gitBranches.data?.branches ?? []).filter(
     (branch) => branch.kind === 'local' && !branch.current && !boundBranches.has(branch.name),
@@ -84,6 +73,34 @@ export function GroupChatHeaderActions({
     || restoreThread.isPending
     || deleteThread.isPending
     || clearThread.isPending
+    || renameThread.isPending
+    || deleting
+
+  const openRename = (thread: GroupThread) => {
+    renameThread.reset()
+    setRenameTitle(thread.title ?? '')
+    setRenameTarget(thread)
+  }
+
+  const openDelete = (targets: GroupThread[], bulk: boolean) => {
+    setDeleteTargets([
+      ...targets.filter((thread) => thread.id !== selectedThread?.id),
+      ...targets.filter((thread) => thread.id === selectedThread?.id),
+    ])
+    setDeleteBulk(bulk)
+    setDeleteOpen(true)
+  }
+
+  const rename = async (event: FormEvent) => {
+    event.preventDefault()
+    if (!renameTarget || !renameTitle.trim() || renameThread.isPending) return
+    try {
+      await renameThread.mutateAsync({ threadId: renameTarget.id, title: renameTitle.trim() })
+      setRenameTarget(null)
+    } catch {
+      // Keep the entered title and show the mutation error for retry.
+    }
+  }
 
   const create = async (event: FormEvent) => {
     event.preventDefault()
@@ -109,76 +126,19 @@ export function GroupChatHeaderActions({
         className="mx-0.5 h-3.5 w-3.5 shrink-0 text-muted-foreground/50"
         aria-hidden="true"
       />
-      <Select
-        value={selectedThread?.id}
-        onValueChange={(threadId) => {
+      <GroupTaskSwitcher
+        groupId={groupId}
+        threads={threads}
+        selectedThread={selectedThread}
+        disabled={mutating}
+        onSelect={(threadId) => {
           prefetchConversation('groups', groupId, threadId)
           onSelect(threadId)
         }}
-        disabled={mutating || threads.length === 0}
-      >
-        <SelectTrigger
-          className="h-8 w-32 border-0 bg-transparent px-2 text-left font-medium shadow-none transition-colors hover:bg-muted/60 data-[state=open]:bg-muted/60 sm:w-48 lg:w-60"
-          aria-label={t('tasks.switcher')}
-          title={selectedThread ? displayLabel(selectedThread) : undefined}
-        >
-          <span className="!flex min-w-0 flex-1 items-center overflow-hidden">
-            <SelectValue className="truncate" placeholder={t('tasks.none')} />
-          </span>
-        </SelectTrigger>
-        <SelectContent className="max-w-[calc(100vw-2rem)] sm:w-80">
-          {activeThreads.length > 0 ? (
-            <SelectGroup>
-              <SelectLabel>{t('tasks.active')}</SelectLabel>
-              {activeThreads.map((thread) => (
-                <SelectItem
-                  key={thread.id}
-                  value={thread.id}
-                  textValue={displayLabel(thread)}
-                  onPointerEnter={() => prefetchConversation('groups', groupId, thread.id)}
-                  onFocus={() => prefetchConversation('groups', groupId, thread.id)}
-                  className="min-w-0 whitespace-nowrap"
-                >
-                  {/* The status travels with the item text, so Radix mirrors
-                      the selected task's own state into the trigger. */}
-                  <span className="flex min-w-0 items-center gap-1.5">
-                    <ThreadStatusIndicator conversationId={groupId} threadId={thread.id} />
-                    <span
-                      className="block max-w-[calc(100vw-6rem)] truncate sm:max-w-64"
-                      title={displayLabel(thread)}
-                    >
-                      {displayLabel(thread)}
-                    </span>
-                  </span>
-                </SelectItem>
-              ))}
-            </SelectGroup>
-          ) : null}
-          {activeThreads.length > 0 && archivedThreads.length > 0 ? <SelectSeparator /> : null}
-          {archivedThreads.length > 0 ? (
-            <SelectGroup>
-              <SelectLabel>{t('tasks.archived')}</SelectLabel>
-              {archivedThreads.map((thread) => (
-                <SelectItem
-                  key={thread.id}
-                  value={thread.id}
-                  textValue={displayLabel(thread, true)}
-                  onPointerEnter={() => prefetchConversation('groups', groupId, thread.id)}
-                  onFocus={() => prefetchConversation('groups', groupId, thread.id)}
-                  className="min-w-0 whitespace-nowrap"
-                >
-                  <span
-                    className="block max-w-[calc(100vw-6rem)] truncate sm:max-w-64"
-                    title={displayLabel(thread, true)}
-                  >
-                    {displayLabel(thread, true)}
-                  </span>
-                </SelectItem>
-              ))}
-            </SelectGroup>
-          ) : null}
-        </SelectContent>
-      </Select>
+        onPrefetch={(threadId) => prefetchConversation('groups', groupId, threadId)}
+        onRename={openRename}
+        onDelete={openDelete}
+      />
 
       <CompactActions label={t('actions.taskActions')} icon={<ListPlus className="h-5 w-5" />}>
       <Dialog open={createOpen} onOpenChange={(open) => {
@@ -265,6 +225,19 @@ export function GroupChatHeaderActions({
         variant="ghost"
         size="icon"
         className="h-8 w-8 text-muted-foreground"
+        disabled={mutating || !selectedThread}
+        onClick={() => { if (selectedThread) openRename(selectedThread) }}
+        aria-label={t('tasks.rename')}
+        title={t('tasks.rename')}
+      >
+        <Pencil className="h-4 w-4" aria-hidden="true" />
+      </Button>
+
+      <Button
+        type="button"
+        variant="ghost"
+        size="icon"
+        className="h-8 w-8 text-muted-foreground"
         disabled={disabled || mutating || !selectedThread}
         onClick={() => setClearOpen(true)}
         aria-label={t('tasks.clearMessages')}
@@ -296,7 +269,7 @@ export function GroupChatHeaderActions({
             size="icon"
             className="h-8 w-8 text-muted-foreground"
             disabled={mutating}
-            onClick={() => setDeleteOpen(true)}
+            onClick={() => { if (selectedThread) openDelete([selectedThread], false) }}
             aria-label={t('tasks.delete')}
             title={t('tasks.delete')}
           >
@@ -318,6 +291,42 @@ export function GroupChatHeaderActions({
         </Button>
       )}
       </CompactActions>
+      <Dialog open={renameTarget !== null} onOpenChange={(open) => { if (!open) setRenameTarget(null) }}>
+        <DialogContent closeLabel={t('common:actions.close')} className="sm:max-w-sm">
+          <form onSubmit={rename} className="space-y-4">
+            <DialogHeader>
+              <DialogTitle>{t('tasks.rename')}</DialogTitle>
+              <DialogDescription>{t('tasks.renameDescription')}</DialogDescription>
+            </DialogHeader>
+            <div className="space-y-1.5">
+              <Label htmlFor="group-task-rename-title">{t('tasks.title')}</Label>
+              <Input
+                id="group-task-rename-title"
+                value={renameTitle}
+                onChange={(event) => setRenameTitle(event.target.value)}
+                maxLength={80}
+                autoFocus
+                onFocus={(event) => event.target.select()}
+                disabled={renameThread.isPending}
+                required
+              />
+            </div>
+            {renameThread.error ? (
+              <p role="alert" className="text-xs text-destructive">
+                {t('tasks.renameError', { message: String(renameThread.error) })}
+              </p>
+            ) : null}
+            <DialogFooter>
+              <DialogClose asChild>
+                <Button type="button" variant="outline">{t('common:actions.cancel')}</Button>
+              </DialogClose>
+              <Button type="submit" disabled={!renameTitle.trim() || renameThread.isPending}>
+                {renameThread.isPending ? t('common:actions.working') : t('common:actions.save')}
+              </Button>
+            </DialogFooter>
+          </form>
+        </DialogContent>
+      </Dialog>
       <ConfirmDialog
         open={clearOpen}
         onOpenChange={setClearOpen}
@@ -344,15 +353,26 @@ export function GroupChatHeaderActions({
       <ConfirmDialog
         open={deleteOpen}
         onOpenChange={setDeleteOpen}
-        title={t('tasks.deleteTitle', { title: selectedThread ? displayTitle(selectedThread) : '' })}
-        description={t('tasks.deleteDescription')}
-        confirmLabel={t('tasks.delete')}
+        title={deleteBulk ? t('tasks.deleteAllArchivedTitle', { count: deleteTargets.length }) : t('tasks.deleteTitle', { title: deleteTargets[0] ? displayTitle(deleteTargets[0]) : '' })}
+        description={t(deleteBulk ? 'tasks.deleteAllArchivedDescription' : 'tasks.deleteDescription')}
+        confirmLabel={t(deleteBulk ? 'tasks.deleteAllArchived' : 'tasks.delete')}
         destructive
         onConfirm={async () => {
-          if (!selectedThread) return
-          const deletedId = selectedThread.id
-          await deleteThread.mutateAsync(deletedId)
-          onDeleted(deletedId)
+          setDeleting(true)
+          try {
+            // Note: Delete the selected task last: changing it remounts the chat.
+            // Stop on failure and keep only unfinished targets for a safe retry.
+            for (const target of deleteTargets) {
+              await deleteThread.mutateAsync(target.id)
+              setDeleteTargets((remaining) => remaining.filter((thread) => thread.id !== target.id))
+              if (target.id === selectedThread?.id) {
+                if (deleteBulk) onDeleted(target.id, deleteTargets.map((thread) => thread.id))
+                else onDeleted(target.id)
+              }
+            }
+          } finally {
+            setDeleting(false)
+          }
         }}
       />
     </div>

@@ -526,6 +526,144 @@ async fn archived_task_threads_restore_and_delete() {
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
+#[tokio::test]
+async fn task_rename_validates_access_and_preserves_task_data() {
+    let (app, state) = router_with_state_for_tests().await;
+    let email = "task-rename@example.test";
+    let token = register_and_login(&app, email).await;
+    let other_token = register_and_login(&app, "other-rename@example.test").await;
+    let owner_id: String = sqlx::query_scalar("SELECT id FROM users WHERE email = ?")
+        .bind(email)
+        .fetch_one(state.db.pool())
+        .await
+        .unwrap();
+    let group_id = Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO groups (id, owner_id, name, created_at, updated_at) \
+         VALUES (?, ?, 'Rename tasks', ?, ?)",
+    )
+    .bind(&group_id)
+    .bind(&owner_id)
+    .bind(NOW)
+    .bind(NOW)
+    .execute(state.db.pool())
+    .await
+    .unwrap();
+
+    let (_, task) = send(
+        &app,
+        authed_json(
+            "POST",
+            &format!("/api/v2/groups/{group_id}/threads"),
+            &token,
+            json!({"title": "Original"}),
+        ),
+    )
+    .await;
+    let task_id = task["id"].as_str().unwrap();
+    let uri = format!("/api/v2/threads/{task_id}");
+    let message_id = seed_message(&state, &group_id, task_id, "keep this message").await;
+    sqlx::query(
+        "UPDATE threads SET git_branch = 'feature/test', worktree_path = 'unchanged' WHERE id = ?",
+    )
+    .bind(task_id)
+    .execute(state.db.pool())
+    .await
+    .unwrap();
+
+    for (request, expected) in [
+        (
+            json_request("PATCH", &uri, None, json!({"title": "Unauthorized"})),
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            authed_json("PATCH", &uri, &other_token, json!({"title": "Other owner"})),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            authed_json("PATCH", &uri, &token, json!({"title": "   "})),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            authed_json("PATCH", &uri, &token, json!({"title": "a".repeat(81)})),
+            StatusCode::BAD_REQUEST,
+        ),
+    ] {
+        let (status, _) = send(&app, request).await;
+        assert_eq!(status, expected);
+    }
+    let (_, unchanged) = send(&app, authed("GET", &uri, &token)).await;
+    assert_eq!(unchanged["title"], "Original");
+
+    for task_status in ["active", "running", "archived"] {
+        sqlx::query("UPDATE threads SET status = ? WHERE id = ?")
+            .bind(task_status)
+            .bind(task_id)
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+        let new_title = format!("重命名 {task_status}");
+        let (status, renamed) = send(
+            &app,
+            authed_json(
+                "PATCH",
+                &uri,
+                &token,
+                json!({"title": format!("  {new_title}  ")}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(renamed["title"], new_title);
+        assert_eq!(renamed["id"], task_id);
+        assert_eq!(renamed["status"], task_status);
+        assert_eq!(renamed["git_branch"], "feature/test");
+        assert_eq!(renamed["worktree_path"], "unchanged");
+        let (_, listed) = send(
+            &app,
+            authed("GET", &format!("/api/v2/groups/{group_id}/threads"), &token),
+        )
+        .await;
+        assert_eq!(listed[0]["title"], new_title);
+    }
+    let (content, status): (String, String) =
+        sqlx::query_as("SELECT content, status FROM messages WHERE id = ?")
+            .bind(&message_id)
+            .fetch_one(state.db.pool())
+            .await
+            .unwrap();
+    assert_eq!(content, "keep this message");
+    assert_eq!(status, "visible");
+
+    sqlx::query("UPDATE threads SET status = 'cleared' WHERE id = ?")
+        .bind(task_id)
+        .execute(state.db.pool())
+        .await
+        .unwrap();
+    let (status, _) = send(
+        &app,
+        authed_json("PATCH", &uri, &token, json!({"title": "Deleted"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    sqlx::query("UPDATE threads SET status = 'active' WHERE id = ?")
+        .bind(task_id)
+        .execute(state.db.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE groups SET conversation_kind = 'direct' WHERE id = ?")
+        .bind(&group_id)
+        .execute(state.db.pool())
+        .await
+        .unwrap();
+    let (status, _) = send(
+        &app,
+        authed_json("PATCH", &uri, &token, json!({"title": "Direct"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
 async fn seed_message(
     state: &qunica_backend::api::AppState,
     group_id: &str,

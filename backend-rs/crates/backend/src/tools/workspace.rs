@@ -226,6 +226,29 @@ impl WorkspaceTools {
     /// for matching and restored on write. The resulting content must not exceed
     /// [`MAX_WRITE_BYTES`].
     pub fn edit(&self, file_path: &str, edits: &[FileEdit]) -> Result<ToolResult, ToolError> {
+        let (index, target, updated) = self.apply_edits(file_path, edits)?;
+        fs::write(&target, updated.as_bytes())?;
+        let rel = self.relative_display(index, &target);
+        Ok(ToolResult::completed(format!(
+            "Edited {rel}; replaced {} block(s).",
+            edits.len()
+        )))
+    }
+
+    /// The content `edit` would write, without writing it. Lets a caller
+    /// review the result of an edit (the decision gate does, for group notes)
+    /// before committing it; the same validation runs, so a preview that
+    /// succeeds is an edit that would.
+    pub fn preview_edit(&self, file_path: &str, edits: &[FileEdit]) -> Result<String, ToolError> {
+        self.apply_edits(file_path, edits)
+            .map(|(_, _, updated)| updated)
+    }
+
+    fn apply_edits(
+        &self,
+        file_path: &str,
+        edits: &[FileEdit],
+    ) -> Result<(usize, PathBuf, String), ToolError> {
         if edits.is_empty() {
             return Err(ToolError::invalid(
                 "edits must contain at least one replacement",
@@ -290,12 +313,7 @@ impl WorkspaceTools {
                 "edited content is too large to write with this tool",
             ));
         }
-        fs::write(&target, updated.as_bytes())?;
-        let rel = self.relative_display(index, &target);
-        Ok(ToolResult::completed(format!(
-            "Edited {rel}; replaced {} block(s).",
-            edits.len()
-        )))
+        Ok((index, target, updated))
     }
 
     /// Delete one regular file. Directories and symlinks are deliberately rejected.

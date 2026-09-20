@@ -50,6 +50,7 @@ use crate::acp::{
     canonicalize_acp_runtime, normalize_acp_runtime, run_acp_agent_stream, AcpEventKind, AcpImage,
     AcpRunRequest, AcpRuntimeProfile,
 };
+use crate::decision::{self, DecisionGate, DecisionScenario};
 use crate::llm::{
     build_provider, effort_from_config, model_from_config, provider_headers_from_json,
     vision_enabled, ChatDelta, ChatMessage, ChatRequest, LlmProvider, ProviderConfig,
@@ -308,6 +309,8 @@ pub async fn run_group_turn_with_stream_id(
         active_turn: None,
         resume: None,
         cancellation: services.cancellation.clone(),
+        decision: None,
+        latest_request: Some(req.content.clone()),
     };
 
     let outcome = match run_inner(&services, &req, &mut ctx).await {
@@ -390,6 +393,10 @@ pub async fn run_thread_resume(
             approval: req.approval.clone(),
         }),
         cancellation: services.cancellation.clone(),
+        decision: None,
+        // A resume replays an interrupted step; there is no new request to
+        // suggest a capability for.
+        latest_request: None,
     };
 
     let outcome = match run_resume_inner(&services, &req, &mut ctx).await {
@@ -423,6 +430,12 @@ struct StreamCtx {
     active_turn: Option<ActiveTurn>,
     resume: Option<ResumeState>,
     cancellation: Option<Arc<AtomicBool>>,
+    /// The owner's decision model, loaded once per turn, or `None` when it is
+    /// off. Every scenario checks its own switch through [`StreamCtx::decision_for`].
+    decision: Option<DecisionGate>,
+    /// The message that started this turn, for scenarios that judge the
+    /// request itself (capability suggestion).
+    latest_request: Option<String>,
 }
 
 struct ResumeState {
@@ -443,6 +456,14 @@ struct ScheduledDispatch {
 }
 
 impl StreamCtx {
+    /// The decision gate, when one is loaded and has `scenario` switched on.
+    fn decision_for(&self, scenario: DecisionScenario) -> Option<DecisionGate> {
+        self.decision
+            .as_ref()
+            .filter(|gate| gate.enabled(scenario))
+            .cloned()
+    }
+
     fn next_event(&mut self, kind: StreamEventKind, payload: Value) -> StreamEvent<Value> {
         let event = StreamEvent::new(self.stream_id, self.seq, kind, payload);
         self.seq += 1;
@@ -687,6 +708,13 @@ async fn run_inner(
         Ok(config) => config,
         Err(err) => return ctx.fail(&err.to_string()).await,
     };
+    ctx.decision = DecisionGate::load(
+        &services.pool,
+        &group.owner_id,
+        group.decision_enabled,
+        &group.decision_scenarios,
+    )
+    .await;
 
     // 1. Persist the user message and announce it.
     let user_message = NewMessage {
@@ -931,6 +959,89 @@ async fn run_scheduled_turn(
         .into_iter()
         .map(Some)
         .collect::<Vec<Option<Candidate>>>();
+    // Note: the pre-filter only ever drops members the model is nearly certain
+    // the message has nothing to do with, and never one the user named.
+    // Proactive mode exists so members can chime in unasked, so the bar for
+    // skipping is "clearly irrelevant", not "probably"; the saving is the full
+    // dispatch (for a CLI agent, a process launch) each skipped member would
+    // otherwise spend to answer <SILENT>.
+    if (group.free_speech || group.proactive_mode) && !direct_chat && remaining.len() >= 2 {
+        if let Some(gate) = ctx.decision_for(DecisionScenario::ProactivePrefilter) {
+            let members = remaining
+                .iter()
+                .flatten()
+                .map(|candidate| decision::PrefilterMember {
+                    agent_id: candidate.agent_id.clone(),
+                    display_name: candidate.display_name.clone(),
+                    role: candidate.system_prompt.clone(),
+                    topology_role: candidate.topology_role.clone(),
+                    pinned: user_mentioned_agent_ids.contains(&candidate.agent_id),
+                })
+                .collect::<Vec<_>>();
+            let context = decision::PrefilterContext {
+                latest_message: &req.content,
+                group_name: &group.name,
+                group_description: group.description.as_deref(),
+                announcement: group.announcement.as_deref(),
+            };
+            let skipped = match await_with_cancellation(
+                ctx,
+                decision::prefilter_members(&gate, &context, &members),
+            )
+            .await
+            {
+                Ok(skipped) => skipped.unwrap_or_default(),
+                Err(_) => return cancel_scheduled_turn(ctx, &store, &turn_id).await,
+            };
+            scheduler_runtime
+                .budget
+                .record_tokens(flush_decision_usage(services, ctx, group).await);
+            if !skipped.is_empty() {
+                for slot in &mut remaining {
+                    if slot.as_ref().is_some_and(|candidate| {
+                        skipped
+                            .iter()
+                            .any(|member| member.agent_id == candidate.agent_id)
+                    }) {
+                        slot.take();
+                    }
+                }
+                let names = skipped
+                    .iter()
+                    .map(|member| member.display_name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                if let Err(error) = ctx
+                    .emit_durable_event(
+                        StreamEventKind::Warning,
+                        json!({
+                            "turn_id": turn_id,
+                            "code": "decision_prefilter",
+                            "message": format!(
+                                "Decision model skipped {names} for this turn: the message does not call for them"
+                            ),
+                            "skipped": skipped
+                                .iter()
+                                .map(|member| json!({
+                                    "agent_id": member.agent_id,
+                                    "display_name": member.display_name,
+                                    "probability": member.probability,
+                                }))
+                                .collect::<Vec<_>>(),
+                        }),
+                    )
+                    .await
+                {
+                    return match error {
+                        StepErr::Cancelled => cancel_scheduled_turn(ctx, &store, &turn_id).await,
+                        StepErr::Db(_) | StepErr::SchedulerPersistence => {
+                            fail_scheduled_persistence(ctx, &store, &turn_id).await
+                        }
+                    };
+                }
+            }
+        }
+    }
     let mut pending_user_mentions = user_mentioned_agent_ids;
     let mut pending_peer_mentions: VecDeque<PeerMention> = VecDeque::new();
     let mut previous_speaker: Option<String> = None;
@@ -1061,7 +1172,85 @@ async fn run_scheduled_turn(
 
             let mut selected_agent_id = None;
             let mut moderator_finished = false;
-            if may_call_moderator && (moderator_candidates.len() >= 2 || automatic_scheduler) {
+            // Note: the decision model answers first, and only the question its
+            // switch covers. A bounded turn asks it to pick the speaker; an
+            // automatic turn asks whether the objective is done. Either answer
+            // replaces one chat-model moderator call. No answer (switched off,
+            // failed, or not confident) leaves the moderator path as it was.
+            let mut decision_selected = false;
+            let mut decision_resolved = false;
+            if may_call_moderator {
+                let turn_context = decision_turn_context(&moderator_objective, &scheduler_runtime);
+                if !automatic_scheduler && moderator_candidates.len() >= 2 {
+                    if let Some(gate) = ctx.decision_for(DecisionScenario::ModeratorSelection) {
+                        let speakers = moderator_candidates
+                            .iter()
+                            .filter_map(|candidate| {
+                                remaining
+                                    .iter()
+                                    .flatten()
+                                    .find(|agent| agent.agent_id == candidate.agent_id)
+                            })
+                            .map(|agent| decision::SpeakerCandidate {
+                                agent_id: agent.agent_id.clone(),
+                                display_name: agent.display_name.clone(),
+                                role: agent.system_prompt.clone(),
+                                topology_role: agent.topology_role.clone(),
+                            })
+                            .collect::<Vec<_>>();
+                        match await_with_cancellation(
+                            ctx,
+                            decision::select_speaker(&gate, &turn_context, &speakers),
+                        )
+                        .await
+                        {
+                            Ok(Some(selection)) => {
+                                tracing::info!(
+                                    turn_id,
+                                    agent_id = %selection.agent_id,
+                                    confidence = selection.confidence,
+                                    "decision model selected the next speaker"
+                                );
+                                selected_agent_id = Some(selection.agent_id);
+                                decision_selected = true;
+                                decision_resolved = true;
+                            }
+                            Ok(None) => {}
+                            Err(_) => return cancel_scheduled_turn(ctx, &store, &turn_id).await,
+                        }
+                    }
+                } else if automatic_scheduler && scheduler_runtime.budget.agent_steps() > 0 {
+                    if let Some(gate) = ctx.decision_for(DecisionScenario::AutomaticFinish) {
+                        match await_with_cancellation(
+                            ctx,
+                            decision::judge_completion(&gate, &turn_context),
+                        )
+                        .await
+                        {
+                            Ok(Some(probability))
+                                if probability >= decision::AUTOMATIC_FINISH_THRESHOLD =>
+                            {
+                                tracing::info!(
+                                    turn_id,
+                                    probability,
+                                    "decision model judged the objective complete"
+                                );
+                                moderator_finished = true;
+                                decision_resolved = true;
+                            }
+                            Ok(_) => {}
+                            Err(_) => return cancel_scheduled_turn(ctx, &store, &turn_id).await,
+                        }
+                    }
+                }
+            }
+            scheduler_runtime
+                .budget
+                .record_tokens(flush_decision_usage(services, ctx, group).await);
+            if !decision_resolved
+                && may_call_moderator
+                && (moderator_candidates.len() >= 2 || automatic_scheduler)
+            {
                 if let (Some(provider_id), Some(model)) = (
                     group.moderator_provider_id.as_deref(),
                     group.moderator_model.as_deref(),
@@ -1281,7 +1470,11 @@ async fn run_scheduled_turn(
                 } else {
                     match selected_agent_id.as_deref() {
                         Some(selected_agent_id) if selected.agent_id == selected_agent_id => {
-                            SelectionReason::Moderator
+                            if decision_selected {
+                                SelectionReason::DecisionModel
+                            } else {
+                                SelectionReason::Moderator
+                            }
                         }
                         _ if moderator_candidates.len() == 1 && moderator_failure.is_none() => {
                             SelectionReason::DeterministicOrder
@@ -1305,6 +1498,9 @@ async fn run_scheduled_turn(
             let SchedulerDecision::Finish { status, reason } = decision else {
                 unreachable!("moderator decisions are resolved before dispatching");
             };
+            scheduler_runtime
+                .budget
+                .record_tokens(flush_decision_usage(services, ctx, group).await);
             let (status, reason, outcome) = match status {
                 TurnStatus::Silence if had_visible => {
                     (TurnStatus::Completed, None, TurnOutcome::Completed)
@@ -1698,6 +1894,9 @@ async fn run_scheduled_turn(
         if !parent_already_terminal {
             complete_scheduled_usage(ctx, &mut scheduler_runtime.budget);
         }
+        scheduler_runtime
+            .budget
+            .record_tokens(flush_decision_usage(services, ctx, group).await);
         if let Err(_error) = store
             .update_turn_budget(
                 &turn_id,
@@ -1747,6 +1946,85 @@ async fn run_scheduled_turn(
                 agent_id, content, ..
             } => {
                 had_visible = true;
+                // Note: read after the reply is already persisted and shown, so
+                // a slow or failed read costs nothing visible. A reply that
+                // asked the user something ends the turn the way the explicit
+                // waiting marker does; one that only restated finished work is
+                // labelled for the moderator, which is told not to dispatch
+                // for repetition.
+                let mut reply_outcome = "visible";
+                if !parent_already_terminal {
+                    if let Some(gate) = ctx.decision_for(DecisionScenario::ReplyOutcome) {
+                        let assessment = match await_with_cancellation(
+                            ctx,
+                            decision::assess_reply(&gate, &content),
+                        )
+                        .await
+                        {
+                            Ok(assessment) => assessment.unwrap_or_default(),
+                            Err(_) => return cancel_scheduled_turn(ctx, &store, &turn_id).await,
+                        };
+                        scheduler_runtime
+                            .budget
+                            .record_tokens(flush_decision_usage(services, ctx, group).await);
+                        if assessment.restated {
+                            reply_outcome = "restated";
+                        }
+                        if assessment.waiting_for_user {
+                            tracing::info!(
+                                turn_id,
+                                agent_id = %agent_id,
+                                "decision model read the reply as waiting for the user"
+                            );
+                            if let Err(error) = ctx
+                                .emit_durable_event(
+                                    StreamEventKind::WaitingForUser,
+                                    json!({
+                                        "agent_id": agent_id,
+                                        "display_name": agent.display_name,
+                                        "message": "Waiting for your input",
+                                        "source": "decision_model",
+                                    }),
+                                )
+                                .await
+                            {
+                                return match error {
+                                    StepErr::Cancelled => Ok(TurnOutcome::Cancelled),
+                                    StepErr::Db(_) | StepErr::SchedulerPersistence => {
+                                        fail_scheduled_persistence(ctx, &store, &turn_id).await
+                                    }
+                                };
+                            }
+                            if store
+                                .transition_turn(
+                                    &turn_id,
+                                    TurnStatus::Running,
+                                    TurnStatus::WaitingForUser,
+                                    Some(TurnReason::WaitingForUser.as_str()),
+                                )
+                                .await
+                                .is_err()
+                            {
+                                tracing::error!(turn_id, "failed to persist waiting turn status");
+                                return fail_scheduled_persistence(ctx, &store, &turn_id).await;
+                            }
+                            match ctx
+                                .emit_durable_event(
+                                    StreamEventKind::Done,
+                                    json!({ "turn_id": turn_id }),
+                                )
+                                .await
+                            {
+                                Ok(()) => {}
+                                Err(StepErr::Cancelled) => return Ok(TurnOutcome::Cancelled),
+                                Err(StepErr::Db(_) | StepErr::SchedulerPersistence) => {
+                                    return fail_scheduled_persistence(ctx, &store, &turn_id).await;
+                                }
+                            }
+                            return Ok(TurnOutcome::WaitingForUser);
+                        }
+                    }
+                }
                 if group.schedules_peer_mentions() && !parent_already_terminal {
                     let peers = match load_candidates(&services.pool, &req.group_id, group).await {
                         Ok(peers) => peers,
@@ -1800,7 +2078,7 @@ async fn run_scheduled_turn(
                     &content,
                     Some(&agent_id),
                     Some(display_name),
-                    Some("visible"),
+                    Some(reply_outcome),
                 );
             }
             AgentRunResult::NoVisible => {
@@ -2054,6 +2332,86 @@ fn record_moderator_message(
     if excess > 0 {
         recent_visible_messages.drain(..excess);
     }
+}
+
+/// The turn as the decision model sees it: the same bounded objective, recent
+/// messages, and progress summary the chat moderator is given.
+fn decision_turn_context<'a>(
+    objective: &'a str,
+    scheduler_runtime: &'a ScheduledTurnRuntime,
+) -> decision::TurnContext<'a> {
+    decision::TurnContext {
+        objective,
+        recent_messages: scheduler_runtime
+            .recent_visible_messages
+            .iter()
+            .map(|message| decision::RecentMessage {
+                role: &message.role,
+                name: message.display_name.as_deref(),
+                content: &message.content,
+                outcome: message.outcome.as_deref(),
+            })
+            .collect(),
+        progress_summary: scheduler_runtime.moderator_summary.as_deref(),
+    }
+}
+
+/// Persist what the decision model has cost since the last flush and return
+/// the tokens, so the caller can charge them to the turn budget.
+///
+/// The gate collects usage from every scenario, the tool-level ones included,
+/// so one flush after each step catches a shell review or a note check made
+/// deep inside the agent loop.
+async fn flush_decision_usage(
+    services: &RuntimeServices,
+    ctx: &StreamCtx,
+    group: &GroupRuntimeConfig,
+) -> u64 {
+    let Some(gate) = ctx.decision.as_ref() else {
+        return 0;
+    };
+    let mut total: u64 = 0;
+    for record in gate.take_usage() {
+        let model = record
+            .model
+            .clone()
+            .unwrap_or_else(|| gate.model().to_string());
+        let dimensions = TokenUsageDimensions {
+            owner_id: &group.owner_id,
+            group_id: &group.id,
+            group_name: &group.name,
+            conversation_kind: &group.conversation_kind,
+            thread_id: &ctx.thread_id,
+            agent_id: None,
+            agent_name: "Decision model",
+            provider_id: None,
+            provider_name: "Decision model",
+            model: &model,
+        };
+        let tokens = record.input_tokens.saturating_add(record.output_tokens);
+        let usage = qunica_domain::runtime::ContextUsage {
+            input_tokens: Some(record.input_tokens),
+            output_tokens: Some(record.output_tokens),
+            total_tokens: Some(tokens),
+            ..Default::default()
+        };
+        if let Err(error) = persist_token_usage(
+            &services.pool,
+            &Uuid::new_v4().to_string(),
+            &dimensions,
+            &usage,
+        )
+        .await
+        {
+            tracing::warn!(
+                error = %error,
+                scenario = record.scenario.as_str(),
+                "failed to persist decision model usage"
+            );
+        }
+        total = total.saturating_add(u64::try_from(tokens).unwrap_or(0));
+    }
+    total
 }
 
 async fn emit_turn_started(
@@ -2500,6 +2858,13 @@ async fn run_resume_inner(
         Ok(group) => group,
         Err(err) => return fail_resume(ctx, &err.to_string()).await,
     };
+    ctx.decision = DecisionGate::load(
+        &services.pool,
+        &group.owner_id,
+        group.decision_enabled,
+        &group.decision_scenarios,
+    )
+    .await;
     let execution = match run_agent_turn(services, ctx, &agent, &group, 0, None, None).await {
         Ok(AgentRunResult::Private(execution)) => execution,
         // The continuation ran on and stopped at a *second* gate — another tool
@@ -2611,6 +2976,10 @@ struct GroupRuntimeConfig {
     moderator_provider_id: Option<String>,
     moderator_model: Option<String>,
     muted_agent_ids: HashSet<String>,
+    /// Whether this group consults the account's decision model, and for
+    /// which scenarios. The endpoint itself is account-level.
+    decision_enabled: bool,
+    decision_scenarios: decision::DecisionScenarios,
 }
 
 struct InvocationContext {
@@ -5602,6 +5971,8 @@ struct GroupRuntimeRow {
     moderator_provider_id: Option<String>,
     moderator_model: Option<String>,
     muted_agent_ids_json: Option<String>,
+    decision_enabled: i64,
+    decision_scenarios_json: String,
 }
 
 async fn load_group_runtime_config(
@@ -5610,7 +5981,8 @@ async fn load_group_runtime_config(
 ) -> anyhow::Result<GroupRuntimeConfig> {
     let row: Option<GroupRuntimeRow> = sqlx::query_as(
         "SELECT id, owner_id, name, conversation_kind, description, announcement, workspace_id, free_speech, \
-                proactive_mode, communication_mode, default_speaking_order_json, scheduler_mode, max_agent_steps, max_steps_per_agent, max_scheduler_hops, max_moderator_calls, max_consecutive_failures, max_total_failures, max_total_tokens, turn_timeout_seconds, moderator_enabled, moderator_provider_id, moderator_model, muted_agent_ids_json \
+                proactive_mode, communication_mode, default_speaking_order_json, scheduler_mode, max_agent_steps, max_steps_per_agent, max_scheduler_hops, max_moderator_calls, max_consecutive_failures, max_total_failures, max_total_tokens, turn_timeout_seconds, moderator_enabled, moderator_provider_id, moderator_model, muted_agent_ids_json, \
+                decision_enabled, decision_scenarios_json \
          FROM groups WHERE id = ? AND status = 'active'",
     )
     .bind(group_id)
@@ -5645,6 +6017,10 @@ async fn load_group_runtime_config(
         moderator_provider_id: row.moderator_provider_id,
         moderator_model: row.moderator_model,
         muted_agent_ids: parse_string_set(row.muted_agent_ids_json.as_deref()),
+        decision_enabled: row.decision_enabled != 0,
+        decision_scenarios: decision::DecisionScenarios::from_json(Some(
+            &row.decision_scenarios_json,
+        )),
     })
 }
 
@@ -6044,6 +6420,39 @@ async fn build_invocation_context(
     let mounted_skills = load_mounted_skills(pool, agent).await?;
     let workspaces = resolve_workspaces(pool, agent, group, &ctx.thread_id).await?;
     let mcp = resolve_mcp_tools(services, agent).await;
+    // Ask which skill or MCP server the request calls for before the prompt is
+    // rendered, so the answer can be one extra line in it. The roster itself is
+    // unchanged; the line only says which entry to read first.
+    let capability_suggestion = match (
+        ctx.decision_for(DecisionScenario::SkillSuggestion),
+        ctx.latest_request.as_deref(),
+    ) {
+        (Some(gate), Some(request)) => {
+            let skills = mounted_skills
+                .iter()
+                .map(|skill| decision::CapabilityOption {
+                    name: skill.name.clone(),
+                    description: skill.description.clone(),
+                })
+                .collect::<Vec<_>>();
+            let servers = mcp
+                .server_summaries()
+                .into_iter()
+                .map(|(name, description)| decision::CapabilityOption {
+                    name,
+                    description: Some(description),
+                })
+                .collect::<Vec<_>>();
+            if skills.is_empty() && servers.is_empty() {
+                decision::CapabilitySuggestion::default()
+            } else {
+                decision::suggest_capabilities(&gate, request, &skills, &servers)
+                    .await
+                    .unwrap_or_default()
+            }
+        }
+        _ => decision::CapabilitySuggestion::default(),
+    };
     let web_search = if enabled_tools.iter().any(|name| name == "WebSearch") {
         crate::api::system_settings::tavily_search_config(pool, &agent.owner_id)
             .await
@@ -6077,6 +6486,7 @@ async fn build_invocation_context(
     .with_media_generation(media_generation)
     .with_shell_preference(shell_preference)
     .with_mcp(services.mcp.clone(), mcp)
+    .with_decision(ctx.decision.clone())
     .with_group_notes(workspaces.notes_root.clone())
     .map_err(|err| anyhow::anyhow!(err.model_safe_message()))?;
 
@@ -6201,6 +6611,7 @@ async fn build_invocation_context(
         &mounted_skills,
         &executor,
         delegation,
+        &capability_suggestion,
     )
     .await?;
 
@@ -6246,6 +6657,14 @@ async fn resolve_mcp_tools(services: &RuntimeServices, agent: &Candidate) -> Mcp
     // servers each sitting on the default 60s timeout would add three minutes to
     // the front of every single turn before the agent says a word; concurrently
     // the worst case is one timeout, and the budget caps even that.
+    let descriptions = rows
+        .iter()
+        .filter_map(|row| {
+            row.description
+                .clone()
+                .map(|description| (row.id.clone(), description))
+        })
+        .collect::<Vec<_>>();
     let listings = rows.into_iter().map(|row| {
         let config = row.to_config();
         let allowed = selections
@@ -6311,7 +6730,7 @@ async fn resolve_mcp_tools(services: &RuntimeServices, agent: &Candidate) -> Mcp
         }
     }
 
-    McpMount::new(bindings, configs, failures)
+    McpMount::new(bindings, configs, failures).with_server_descriptions(descriptions)
 }
 
 /// Build the provider tool definition for one MCP tool.
@@ -6402,6 +6821,7 @@ fn enabled_mcp_selections(raw: Option<&str>) -> Vec<McpSelection> {
     selections
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn build_agent_system_prompt(
     pool: &SqlitePool,
     ctx: &StreamCtx,
@@ -6410,6 +6830,7 @@ async fn build_agent_system_prompt(
     mounted_skills: &[MountedSkill],
     executor: &ToolExecutor,
     delegation: DelegationAvailability,
+    capability_suggestion: &decision::CapabilitySuggestion,
 ) -> anyhow::Result<String> {
     let roster = load_group_roster(pool, &ctx.group_id, &agent.agent_id).await?;
     let skill_lines = if mounted_skills.is_empty() {
@@ -6493,6 +6914,9 @@ async fn build_agent_system_prompt(
         sections.push(format!(
             "Mounted skills (load only when relevant):\n{skill_lines}"
         ));
+    }
+    if let Some(suggestion) = capability_suggestion.render() {
+        sections.push(suggestion);
     }
     if executor.has_group_notes() {
         sections.push(

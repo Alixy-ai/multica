@@ -7,7 +7,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { enUS } from '@/i18n/resources/en-US'
 import { zhCN } from '@/i18n/resources/zh-CN'
-import { MediaSettingsPage } from '@/pages/settings/MediaSettingsPage'
+import { DecisionSettingsPage } from '@/pages/settings/DecisionSettingsPage'
 import { useAuthStore } from '@/stores/authStore'
 import type { SystemSettingsRead } from '@/types/api'
 
@@ -65,20 +65,20 @@ async function renderPage() {
       <QueryClientProvider
         client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}
       >
-        <MediaSettingsPage />
+        <DecisionSettingsPage />
       </QueryClientProvider>
     </I18nextProvider>,
   )
 }
 
-describe('MediaSettingsPage', () => {
+describe('DecisionSettingsPage', () => {
   afterEach(() => {
     cleanup()
     vi.unstubAllGlobals()
     useAuthStore.setState({ token: null, user: null, hydrated: false })
   })
 
-  it('saves shared credentials and independent image/video models', async () => {
+  it('saves the endpoint, key, model and confidence floor', async () => {
     useAuthStore.setState({ token: 'token' })
     const fetchMock = vi
       .fn<typeof fetch>()
@@ -86,35 +86,69 @@ describe('MediaSettingsPage', () => {
       .mockResolvedValueOnce(
         jsonResponse({
           ...settings,
-          media_api_key_configured: true,
-          image_generation_model: 'image-model',
-          video_generation_model: 'video-model',
+          decision_api_key_configured: true,
+          decision_min_confidence: 0.6,
         }),
       )
     vi.stubGlobal('fetch', fetchMock)
     const user = userEvent.setup()
 
     await renderPage()
-    expect(await screen.findByRole('heading', { name: 'Media generation' })).toBeVisible()
+    expect(await screen.findByRole('heading', { name: 'Decision model' })).toBeVisible()
+    // The switches live on each group, not here.
+    expect(screen.queryByRole('switch')).toBeNull()
+    expect(screen.getByText(/chosen per group/)).toBeVisible()
 
     const apiKey = screen.getByLabelText('API key')
     await waitFor(() => expect(apiKey).toBeEnabled())
-    await user.type(apiKey, 'secret-key')
-    await user.type(screen.getByLabelText('Default model', { selector: '#media-image-model' }), 'image-model')
-    await user.type(screen.getByLabelText('Default model', { selector: '#media-video-model' }), 'video-model')
+    await user.type(apiKey, 'sk-or-secret')
+    const confidence = screen.getByLabelText('Minimum confidence')
+    await user.clear(confidence)
+    await user.type(confidence, '0.6')
     await user.click(screen.getByRole('button', { name: 'Save' }))
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
     const [, init] = fetchMock.mock.calls[1] as [string, RequestInit]
     expect(init.method).toBe('PATCH')
-    expect(JSON.parse(String(init.body))).toMatchObject({
-      media_api_key: 'secret-key',
-      image_generation_model: 'image-model',
-      video_generation_model: 'video-model',
-      image_generation_endpoint: '/v1/images/generations',
-      video_generation_endpoint: '/v1/videos',
-      video_status_endpoint: '/v1/videos/{id}',
-      video_content_endpoint: '/v1/videos/{id}/content',
+    expect(JSON.parse(String(init.body))).toEqual({
+      decision_api_key: 'sk-or-secret',
+      decision_endpoint: 'https://openrouter.ai/api/alpha/decisions',
+      decision_model: '~typesafe/jev-latest',
+      decision_min_confidence: 0.6,
     })
+    expect(await screen.findByText('Ready')).toBeVisible()
+  })
+
+  it('tests the endpoint with the key typed but not yet saved', async () => {
+    useAuthStore.setState({ token: 'token' })
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(jsonResponse(settings))
+      .mockResolvedValueOnce(
+        jsonResponse({
+          ok: true,
+          model: 'typesafe/jev-1.13',
+          sample_probability: 0.91,
+          input_tokens: 40,
+          message: 'The decision endpoint answered.',
+          dialect: 'ai_sdk_gateway',
+        }),
+      )
+    vi.stubGlobal('fetch', fetchMock)
+    const user = userEvent.setup()
+
+    await renderPage()
+    const apiKey = await screen.findByLabelText('API key')
+    await waitFor(() => expect(apiKey).toBeEnabled())
+    await user.type(apiKey, 'sk-or-secret')
+    await user.click(screen.getByRole('button', { name: 'Test connection' }))
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+    const [url, init] = fetchMock.mock.calls[1] as [string, RequestInit]
+    expect(String(url)).toContain('/settings/decision/test')
+    expect(init.method).toBe('POST')
+    expect(JSON.parse(String(init.body))).toMatchObject({ api_key: 'sk-or-secret' })
+    expect(await screen.findByRole('status')).toHaveTextContent('typesafe/jev-1.13')
+    expect(screen.getByRole('status')).toHaveTextContent('via Vercel AI Gateway')
   })
 })

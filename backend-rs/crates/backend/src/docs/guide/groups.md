@@ -8,6 +8,12 @@ A group needs a name. Binding a workspace is what lets its agents touch files; w
 
 You can save an existing group's settings and Agent roster as a reusable template from the group's settings page. Choosing that template while creating another group copies the saved configuration; the new group's name and workspace are still chosen separately.
 
+## Managing tasks
+
+Open the current task selector to switch between active and archived tasks. Each row has a **Rename task** action; renaming changes only the title and preserves messages, execution state, and Git bindings. Titles contain 1–80 characters after trimming whitespace.
+
+Archived rows also have **Delete task**, and the archived section has **Delete all archived**. Both ask for confirmation. Deletion removes the task and its messages from the app, keeps its Git branch, and attempts to remove its worktree. Bulk deletion uses the archived tasks shown when the confirmation opens; active tasks are untouched. If a deletion fails, completed deletions stay applied and the dialog allows retrying the remaining tasks.
+
 ## Who replies
 
 - **Mentions.** In mentioned-only mode, `@Name` selects the responders. In a group-wide mode, mentions choose who starts without removing the other eligible agents from the turn.
@@ -55,6 +61,8 @@ Budgets that end a turn when exhausted:
 - `max_total_tokens`
 
 A **moderator** can be enabled with its own provider and model to pick the next legal speaker. Automatic mode requires it. `turn_timeout_seconds` currently limits moderator calls; it is not an agent execution timeout.
+
+When the group has the [decision model](settings.md#decision-model) switched on (`decision_enabled` and one or more `decision_scenarios`, both per group; the endpoint itself is set once under Settings), its scenarios sit in front of these steps: `moderator_selection` picks the bounded speaker and the dispatch records reason `decision_model`; `automatic_finish` ends an automatic turn once the objective reads as complete; `proactive_prefilter` drops clearly irrelevant members from a proactive or everyone turn and emits a `warning` with code `decision_prefilter` naming them; `reply_outcome` ends the turn as waiting-for-user when a reply asked the user and stopped. Each falls back to the behaviour above when the model fails or is unsure. Templates carry the group's switches.
 
 See [the scheduler design](../../../../../../docs/GROUP_SCHEDULER.md) for the runtime and persistence contract.
 

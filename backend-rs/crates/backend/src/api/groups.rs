@@ -23,6 +23,7 @@ use crate::api::{
     workspace_files::{self, ConversationScope},
     AppState,
 };
+use crate::decision::DecisionScenarios;
 use crate::git::{
     self as workspace_git, DiffMode, WorkspaceGitBranches, WorkspaceGitCommitDetails,
     WorkspaceGitDiff, WorkspaceGitLog, WorkspaceGitStatus,
@@ -58,6 +59,7 @@ const GROUP_COLUMNS: &str = "id, owner_id, workspace_id, auto_share_workspace_wi
      max_scheduler_hops, max_moderator_calls, max_consecutive_failures, \
      max_total_failures, max_total_tokens, turn_timeout_seconds, moderator_enabled, \
      moderator_provider_id, moderator_model, \
+     decision_enabled, decision_scenarios_json, \
      muted_agent_ids_json, admin_agent_ids_json, muted_member_ids_json, status, \
      created_at, updated_at";
 
@@ -208,7 +210,57 @@ pub struct CreateRequest {
     #[serde(default)]
     moderator_model: Option<String>,
     #[serde(default)]
+    decision_enabled: Option<bool>,
+    #[serde(default)]
+    decision_scenarios: Option<DecisionScenariosPatch>,
+    #[serde(default)]
     initial_agents: Option<Vec<String>>,
+}
+
+/// A partial update of the group's decision-model switches: absent keys keep
+/// their value. Unknown scenario names are refused rather than dropped, so a
+/// typo does not read as "saved".
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DecisionScenariosPatch {
+    moderator_selection: Option<bool>,
+    automatic_finish: Option<bool>,
+    proactive_prefilter: Option<bool>,
+    shell_risk: Option<bool>,
+    skill_suggestion: Option<bool>,
+    note_validation: Option<bool>,
+    reply_outcome: Option<bool>,
+}
+
+impl DecisionScenariosPatch {
+    fn apply(&self, current: &mut DecisionScenarios) {
+        let fields = [
+            (self.moderator_selection, &mut current.moderator_selection),
+            (self.automatic_finish, &mut current.automatic_finish),
+            (self.proactive_prefilter, &mut current.proactive_prefilter),
+            (self.shell_risk, &mut current.shell_risk),
+            (self.skill_suggestion, &mut current.skill_suggestion),
+            (self.note_validation, &mut current.note_validation),
+            (self.reply_outcome, &mut current.reply_outcome),
+        ];
+        for (patch, target) in fields {
+            if let Some(value) = patch {
+                *target = value;
+            }
+        }
+    }
+
+    fn from_scenarios(scenarios: &DecisionScenarios) -> Self {
+        Self {
+            moderator_selection: Some(scenarios.moderator_selection),
+            automatic_finish: Some(scenarios.automatic_finish),
+            proactive_prefilter: Some(scenarios.proactive_prefilter),
+            shell_risk: Some(scenarios.shell_risk),
+            skill_suggestion: Some(scenarios.skill_suggestion),
+            note_validation: Some(scenarios.note_validation),
+            reply_outcome: Some(scenarios.reply_outcome),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -240,6 +292,10 @@ pub struct GroupTemplateConfig {
     moderator_enabled: bool,
     moderator_provider_id: Option<String>,
     moderator_model: Option<String>,
+    #[serde(default)]
+    decision_enabled: bool,
+    #[serde(default)]
+    decision_scenarios: DecisionScenarios,
     initial_agents: Vec<String>,
 }
 
@@ -306,6 +362,12 @@ pub struct UpdateRequest {
     moderator_provider_id: Option<Option<String>>,
     #[serde(default, deserialize_with = "double_option")]
     moderator_model: Option<Option<String>>,
+    #[serde(default)]
+    decision_enabled: Option<bool>,
+    /// A partial object updates only the named scenarios; `null` turns every
+    /// scenario off.
+    #[serde(default, deserialize_with = "double_option")]
+    decision_scenarios: Option<Option<DecisionScenariosPatch>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -559,6 +621,8 @@ pub struct GroupResponse {
     moderator_enabled: bool,
     moderator_provider_id: Option<String>,
     moderator_model: Option<String>,
+    decision_enabled: bool,
+    decision_scenarios: DecisionScenarios,
     muted_agent_ids: Option<Vec<String>>,
     admin_agent_ids: Option<Vec<String>>,
     muted_member_ids: Option<Vec<String>>,
@@ -702,6 +766,8 @@ struct GroupRow {
     moderator_enabled: i64,
     moderator_provider_id: Option<String>,
     moderator_model: Option<String>,
+    decision_enabled: i64,
+    decision_scenarios_json: String,
     muted_agent_ids_json: Option<String>,
     admin_agent_ids_json: Option<String>,
     muted_member_ids_json: Option<String>,
@@ -986,6 +1052,8 @@ impl From<GroupRow> for GroupResponse {
             moderator_enabled: row.moderator_enabled != 0,
             moderator_provider_id: row.moderator_provider_id,
             moderator_model: row.moderator_model,
+            decision_enabled: row.decision_enabled != 0,
+            decision_scenarios: DecisionScenarios::from_json(Some(&row.decision_scenarios_json)),
             muted_agent_ids: parse_json_list(row.muted_agent_ids_json.as_deref()),
             admin_agent_ids: parse_json_list(row.admin_agent_ids_json.as_deref()),
             muted_member_ids: parse_json_list(row.muted_member_ids_json.as_deref()),
@@ -1141,6 +1209,13 @@ async fn apply_group_template(
         .take()
         .or(config.moderator_provider_id);
     body.moderator_model = body.moderator_model.take().or(config.moderator_model);
+    body.decision_enabled = body.decision_enabled.or(Some(config.decision_enabled));
+    body.decision_scenarios =
+        body.decision_scenarios
+            .take()
+            .or(Some(DecisionScenariosPatch::from_scenarios(
+                &config.decision_scenarios,
+            )));
     body.initial_agents = body.initial_agents.take().or(Some(config.initial_agents));
     Ok(())
 }
@@ -1213,6 +1288,8 @@ pub(crate) async fn create_group_template_inner(
         moderator_enabled: group.moderator_enabled != 0,
         moderator_provider_id: group.moderator_provider_id,
         moderator_model: group.moderator_model,
+        decision_enabled: group.decision_enabled != 0,
+        decision_scenarios: DecisionScenarios::from_json(Some(&group.decision_scenarios_json)),
         initial_agents,
     };
     let id = Uuid::new_v4().to_string();
@@ -1321,6 +1398,14 @@ pub(crate) async fn create_inner(
     let agent_free_mention_max_dispatches = 0;
     let communication_mode = validate_communication_mode(body.communication_mode.as_deref())?;
     let scheduler = SchedulerConfigFields::for_create(state.db.pool(), &owner_id, &body).await?;
+    let decision_enabled = body.decision_enabled.unwrap_or(false);
+    let decision_scenarios = {
+        let mut scenarios = DecisionScenarios::default();
+        if let Some(patch) = &body.decision_scenarios {
+            patch.apply(&mut scenarios);
+        }
+        scenarios
+    };
     let initial_agents =
         validate_initial_agents(state.db.pool(), body.initial_agents.as_deref(), &owner_id).await?;
 
@@ -1343,9 +1428,9 @@ pub(crate) async fn create_inner(
           scheduler_mode, scheduler_enabled, agent_mention_policy, max_agent_steps, max_steps_per_agent, \
           max_scheduler_hops, max_moderator_calls, max_consecutive_failures, \
           max_total_failures, max_total_tokens, turn_timeout_seconds, moderator_enabled, \
-          moderator_provider_id, moderator_model, \
+          moderator_provider_id, moderator_model, decision_enabled, decision_scenarios_json, \
           status, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
                  'active', ?, ?)",
     )
     .bind(&id)
@@ -1373,6 +1458,8 @@ pub(crate) async fn create_inner(
     .bind(scheduler.moderator_enabled)
     .bind(&scheduler.moderator_provider_id)
     .bind(&scheduler.moderator_model)
+    .bind(decision_enabled as i64)
+    .bind(decision_scenarios.to_json())
     .bind(&now)
     .bind(&now)
     .execute(&mut *tx)
@@ -1665,6 +1752,20 @@ pub(crate) async fn update_inner(
         Some(None) => None,
         None => existing.default_speaking_order_json.clone(),
     };
+    let decision_enabled = body
+        .decision_enabled
+        .map(i64::from)
+        .unwrap_or(existing.decision_enabled);
+    let decision_scenarios_json = match body.decision_scenarios {
+        Some(Some(ref patch)) => {
+            let mut scenarios =
+                DecisionScenarios::from_json(Some(&existing.decision_scenarios_json));
+            patch.apply(&mut scenarios);
+            scenarios.to_json()
+        }
+        Some(None) => DecisionScenarios::default().to_json(),
+        None => existing.decision_scenarios_json.clone(),
+    };
 
     let now = now_rfc3339();
     let mut tx = crate::db::begin_write(state.db.pool())
@@ -1679,7 +1780,8 @@ pub(crate) async fn update_inner(
          max_agent_steps = ?, max_steps_per_agent = ?, max_scheduler_hops = ?, \
          max_moderator_calls = ?, max_consecutive_failures = ?, max_total_failures = ?, \
          max_total_tokens = ?, turn_timeout_seconds = ?, moderator_enabled = ?, \
-         moderator_provider_id = ?, moderator_model = ?, updated_at = ? \
+         moderator_provider_id = ?, moderator_model = ?, \
+         decision_enabled = ?, decision_scenarios_json = ?, updated_at = ? \
          WHERE id = ? AND owner_id = ?",
     )
     .bind(&name)
@@ -1707,6 +1809,8 @@ pub(crate) async fn update_inner(
     .bind(scheduler.moderator_enabled)
     .bind(&scheduler.moderator_provider_id)
     .bind(&scheduler.moderator_model)
+    .bind(decision_enabled)
+    .bind(&decision_scenarios_json)
     .bind(&now)
     .bind(&group_id)
     .bind(&owner_id)

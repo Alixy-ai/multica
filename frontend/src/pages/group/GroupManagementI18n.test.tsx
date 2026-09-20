@@ -128,6 +128,7 @@ vi.mock('@/hooks/useGroupThreads', () => ({
     error: null,
     isLoading: mocks.groupThreadsLoading,
   }),
+  useRenameGroupThread: () => ({ isPending: false, error: null, reset: vi.fn(), mutateAsync: vi.fn() }),
   useCreateGroupThread: () => ({
     error: null,
     isPending: false,
@@ -246,6 +247,16 @@ const group: GroupRead = {
   moderator_enabled: false,
   moderator_provider_id: null,
   moderator_model: null,
+  decision_enabled: false,
+  decision_scenarios: {
+    moderator_selection: false,
+    automatic_finish: false,
+    proactive_prefilter: false,
+    shell_risk: false,
+    skill_suggestion: false,
+    note_validation: false,
+    reply_outcome: false,
+  },
 }
 
 const humanMember: GroupMemberRead = {
@@ -476,7 +487,7 @@ describe('group management i18n', () => {
       </MemoryRouter>,
     )
 
-    expect(screen.getByRole('combobox', { name: 'Current task' })).toHaveTextContent('Second task')
+    expect(screen.getByRole('button', { name: 'Current task' })).toHaveTextContent('Second task')
     expect(mocks.useGroupAgents).toHaveBeenCalledWith('group-1', 'thread-2')
   })
 
@@ -495,7 +506,7 @@ describe('group management i18n', () => {
       </MemoryRouter>,
     )
 
-    expect(screen.getByRole('combobox', { name: 'Current task' })).toBeEnabled()
+    expect(screen.getByRole('button', { name: 'Current task' })).toBeEnabled()
     expect(screen.getByRole('button', { name: 'Start new task' })).toBeEnabled()
     expect(screen.getByRole('button', { name: 'Archive task' })).toBeDisabled()
   })
@@ -536,6 +547,33 @@ describe('group management i18n', () => {
       expect(mocks.deleteTaskMutateAsync).toHaveBeenCalledWith('thread-2')
       expect(window.localStorage.getItem('qunica:groups:selected-thread:group-1'))
         .toBe('thread-1')
+    })
+  })
+
+  it('clears persisted selection when all archived tasks are deleted', async () => {
+    const user = userEvent.setup()
+    mocks.groupThreads = [
+      { ...taskThread, status: 'archived' },
+      { ...taskThread, id: 'thread-2', title: 'Second task', status: 'archived' },
+    ]
+    mocks.deleteTaskMutateAsync.mockImplementation(async (threadId: string) => {
+      mocks.groupThreads = mocks.groupThreads.filter((thread) => thread.id !== threadId)
+    })
+    window.localStorage.setItem('qunica:groups:selected-thread:group-1', taskThread.id)
+    render(
+      <MemoryRouter initialEntries={['/groups/group-1']}>
+        <Routes>
+          <Route path="/groups/:groupId" element={<GroupChatPage />} />
+        </Routes>
+      </MemoryRouter>,
+    )
+    await user.click(screen.getByRole('button', { name: 'Current task' }))
+    await user.click(screen.getByRole('button', { name: 'Delete all archived' }))
+    await user.click(within(screen.getByRole('alertdialog')).getByRole('button', { name: 'Delete all archived' }))
+    await waitFor(() => {
+      expect(mocks.deleteTaskMutateAsync.mock.calls.map(([id]) => id)).toEqual(['thread-2', taskThread.id])
+      expect(window.localStorage.getItem('qunica:groups:selected-thread:group-1')).toBeNull()
+      expect(screen.getByRole('button', { name: 'Current task' })).toBeDisabled()
     })
   })
 

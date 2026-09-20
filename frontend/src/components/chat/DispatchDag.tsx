@@ -139,6 +139,7 @@ const reasonKeys = {
   deterministic_order: 'trace.reasons.deterministic_order',
   moderator: 'trace.reasons.moderator',
   moderator_fallback: 'trace.reasons.moderator_fallback',
+  decision_model: 'trace.reasons.decision_model',
 } as const satisfies Record<SchedulerSelectionReason, string>
 
 const statusKeys = {

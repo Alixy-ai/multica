@@ -38,6 +38,24 @@ export function useCreateGroupThread(groupId: string) {
   })
 }
 
+export function useRenameGroupThread(groupId: string) {
+  const token = useAuthStore((state) => state.token)
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ threadId, title }: { threadId: string; title: string }) =>
+      fetchJson<GroupThread>(`/threads/${threadId}`, {
+        method: 'PATCH',
+        token,
+        body: { title },
+      }),
+    onSuccess: (renamed) => {
+      queryClient.setQueryData<GroupThread[]>(groupThreadsKey(groupId), (threads = []) =>
+        threads.map((thread) => thread.id === renamed.id ? renamed : thread),
+      )
+    },
+  })
+}
+
 export function useArchiveGroupThread(groupId: string) {
   const token = useAuthStore((state) => state.token)
   const queryClient = useQueryClient()

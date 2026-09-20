@@ -76,6 +76,29 @@ export interface GroupSchedulerConfig {
   moderator_model: string | null
 }
 
+/**
+ * The runtime steps a System One decision model may take over in one group.
+ * Each is a separate switch; all are off until the owner turns them on, because
+ * every evaluation sends conversation excerpts to the configured endpoint.
+ */
+export interface DecisionScenarios {
+  moderator_selection: boolean
+  automatic_finish: boolean
+  proactive_prefilter: boolean
+  shell_risk: boolean
+  skill_suggestion: boolean
+  note_validation: boolean
+  reply_outcome: boolean
+}
+
+export type DecisionScenarioKey = keyof DecisionScenarios
+
+/** Per-group use of the account's decision endpoint. */
+export interface GroupDecisionConfig {
+  decision_enabled: boolean
+  decision_scenarios: DecisionScenarios
+}
+
 export type GroupTurnStatus =
   | 'pending'
   | 'running'
@@ -108,6 +131,7 @@ export type SchedulerSelectionReason =
   | 'deterministic_order'
   | 'moderator'
   | 'moderator_fallback'
+  | 'decision_model'
 
 export type GroupTurnTerminationReason =
   | 'waiting_for_user'

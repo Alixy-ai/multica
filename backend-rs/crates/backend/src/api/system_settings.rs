@@ -9,6 +9,7 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use uuid::Uuid;
 
 use crate::api::{auth::current_user_id, error::ApiError, AppState};
+use crate::decision::DecisionConnection;
 use crate::tools::{MediaGenerationConfig, ShellPreference, TavilySearchConfig};
 
 const DEFAULT_WEB_SEARCH_PROVIDER: &str = "tavily";
@@ -29,7 +30,9 @@ const SETTINGS_COLUMNS: &str =
      tavily_api_key, tavily_search_url, tavily_max_results, tavily_search_depth, \
      tavily_include_answer, tavily_include_raw_content, media_base_url, media_api_key, \
      image_generation_model, image_generation_endpoint, video_generation_model, \
-     video_generation_endpoint, video_status_endpoint, video_content_endpoint, created_at, updated_at";
+     video_generation_endpoint, video_status_endpoint, video_content_endpoint, \
+     decision_endpoint, decision_api_key, decision_model, decision_min_confidence, \
+     created_at, updated_at";
 
 #[derive(Debug, Deserialize)]
 pub struct UpdateRequest {
@@ -79,6 +82,14 @@ pub struct UpdateRequest {
     video_status_endpoint: Option<Option<String>>,
     #[serde(default, deserialize_with = "double_option")]
     video_content_endpoint: Option<Option<String>>,
+    #[serde(default, deserialize_with = "double_option")]
+    decision_endpoint: Option<Option<String>>,
+    #[serde(default, deserialize_with = "double_option")]
+    decision_api_key: Option<Option<String>>,
+    #[serde(default, deserialize_with = "double_option")]
+    decision_model: Option<Option<String>>,
+    #[serde(default, deserialize_with = "double_option")]
+    decision_min_confidence: Option<Option<f64>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -108,6 +119,10 @@ pub struct SettingsResponse {
     video_generation_endpoint: String,
     video_status_endpoint: String,
     video_content_endpoint: String,
+    decision_endpoint: String,
+    decision_api_key_configured: bool,
+    decision_model: String,
+    decision_min_confidence: f64,
     created_at: String,
     updated_at: String,
 }
@@ -139,12 +154,28 @@ struct SettingsRow {
     video_generation_endpoint: String,
     video_status_endpoint: String,
     video_content_endpoint: String,
+    decision_endpoint: String,
+    decision_api_key: Option<String>,
+    decision_model: String,
+    decision_min_confidence: f64,
     created_at: String,
     updated_at: String,
 }
 
+impl SettingsRow {
+    fn decision_connection(&self) -> DecisionConnection {
+        DecisionConnection {
+            endpoint: self.decision_endpoint.clone(),
+            api_key: self.decision_api_key.clone(),
+            model: self.decision_model.clone(),
+            min_confidence: self.decision_min_confidence,
+        }
+    }
+}
+
 impl From<SettingsRow> for SettingsResponse {
     fn from(row: SettingsRow) -> Self {
+        let decision = row.decision_connection();
         Self {
             id: row.id,
             owner_id: row.owner_id,
@@ -177,10 +208,23 @@ impl From<SettingsRow> for SettingsResponse {
             video_generation_endpoint: row.video_generation_endpoint,
             video_status_endpoint: row.video_status_endpoint,
             video_content_endpoint: row.video_content_endpoint,
+            decision_api_key_configured: decision.is_configured(),
+            decision_endpoint: decision.endpoint,
+            decision_model: decision.model,
+            decision_min_confidence: decision.min_confidence,
             created_at: row.created_at,
             updated_at: row.updated_at,
         }
     }
+}
+
+/// The owner's decision-endpoint connection, for the runtime gate.
+pub(crate) async fn decision_connection(
+    pool: &SqlitePool,
+    owner_id: &str,
+) -> Result<DecisionConnection, ApiError> {
+    let row = get_or_create(pool, owner_id).await?;
+    Ok(row.decision_connection())
 }
 
 pub(crate) async fn tavily_search_config(
@@ -397,6 +441,23 @@ pub async fn update(
         )?,
         None => existing.video_content_endpoint.clone(),
     };
+    let decision_endpoint = match body.decision_endpoint {
+        Some(ref value) => normalize_decision_endpoint(value.as_deref())?,
+        None => existing.decision_endpoint.clone(),
+    };
+    let decision_api_key = match body.decision_api_key {
+        Some(ref value) => normalize_key(value.as_deref()),
+        None => existing.decision_api_key.clone(),
+    };
+    let decision_model = match body.decision_model {
+        Some(value) => normalize_model(value, "decision_model")?
+            .unwrap_or_else(|| crate::decision::DEFAULT_MODEL.to_string()),
+        None => existing.decision_model.clone(),
+    };
+    let decision_min_confidence = match body.decision_min_confidence {
+        Some(value) => normalize_min_confidence(value)?,
+        None => existing.decision_min_confidence,
+    };
 
     let now = now_rfc3339();
     sqlx::query(
@@ -405,7 +466,9 @@ pub async fn update(
          tavily_search_url = ?, tavily_max_results = ?, tavily_search_depth = ?, \
          tavily_include_answer = ?, tavily_include_raw_content = ?, media_base_url = ?, media_api_key = ?, \
          image_generation_model = ?, image_generation_endpoint = ?, video_generation_model = ?, \
-         video_generation_endpoint = ?, video_status_endpoint = ?, video_content_endpoint = ?, updated_at = ? \
+         video_generation_endpoint = ?, video_status_endpoint = ?, video_content_endpoint = ?, \
+         decision_endpoint = ?, decision_api_key = ?, decision_model = ?, \
+         decision_min_confidence = ?, updated_at = ? \
          WHERE owner_id = ?",
     )
     .bind(&appearance)
@@ -435,6 +498,10 @@ pub async fn update(
     .bind(&video_generation_endpoint)
     .bind(&video_status_endpoint)
     .bind(&video_content_endpoint)
+    .bind(&decision_endpoint)
+    .bind(&decision_api_key)
+    .bind(&decision_model)
+    .bind(decision_min_confidence)
     .bind(&now)
     .bind(&owner_id)
     .execute(state.db.pool())
@@ -445,6 +512,109 @@ pub async fn update(
         .await?
         .ok_or_else(|| ApiError::internal("system settings vanished after update"))?;
     Ok(Json(row.into()))
+}
+
+/// What the connectivity test sends: an optional key to try before saving it.
+/// Every other field falls back to the saved settings.
+#[derive(Debug, Default, Deserialize)]
+pub struct DecisionTestRequest {
+    #[serde(default)]
+    endpoint: Option<String>,
+    #[serde(default)]
+    api_key: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DecisionTestResponse {
+    ok: bool,
+    /// The versioned model the endpoint reported, when it did. The gateway
+    /// dialect reports none.
+    model: Option<String>,
+    /// The probability the sample sentence conveys urgency; a sanity check
+    /// that the endpoint is a decision endpoint and not a chat one.
+    sample_probability: Option<f64>,
+    input_tokens: Option<i64>,
+    message: String,
+    /// Which wire dialect the endpoint URL selected.
+    dialect: &'static str,
+}
+
+/// Send one small request to the decision endpoint and report whether it
+/// answered. Uses the saved key unless the body carries one.
+pub async fn test_decision(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Option<Json<DecisionTestRequest>>,
+) -> Result<Json<DecisionTestResponse>, ApiError> {
+    let owner_id = current_user_id(&headers, &state.auth.secret_key)?;
+    let body = body.map(|Json(body)| body).unwrap_or_default();
+    let saved = get_or_create(state.db.pool(), &owner_id).await?;
+    let endpoint = match body.endpoint {
+        Some(ref value) => normalize_decision_endpoint(Some(value))?,
+        None => saved.decision_endpoint.clone(),
+    };
+    let model = normalize_model(body.model, "model")?.unwrap_or(saved.decision_model.clone());
+    let api_key = normalize_key(body.api_key.as_deref())
+        .or_else(|| normalize_key(saved.decision_api_key.as_deref()))
+        .ok_or_else(|| ApiError::invalid_input("a decision API key is required"))?;
+
+    let client = crate::decision::DecisionClient::new(
+        &endpoint,
+        api_key,
+        &model,
+        crate::decision::DECISION_TIMEOUT,
+    )
+    .map_err(|error| ApiError::invalid_input(error.to_string()))?;
+    let questions = std::collections::BTreeMap::from([(
+        "is_urgent".to_string(),
+        crate::decision::Question::noul(
+            "Does this message convey urgency?",
+            "Explicitly time-sensitive",
+            "No urgency expressed",
+        ),
+    )]);
+    match client
+        .evaluate(
+            serde_json::Value::String("Help! My payouts have been failing for 3 days.".to_string()),
+            questions,
+        )
+        .await
+    {
+        Ok(response) => {
+            let usage = response.usage.clone().unwrap_or_default();
+            let sample_probability = response.noul("is_urgent");
+            let message = if sample_probability.is_some() {
+                "The decision endpoint answered.".to_string()
+            } else {
+                "The endpoint answered, but not with a decision: check that it is a System One \
+                 endpoint and the model is a decision model."
+                    .to_string()
+            };
+            Ok(Json(DecisionTestResponse {
+                ok: sample_probability.is_some(),
+                model: response.model,
+                sample_probability,
+                input_tokens: usage.input_tokens,
+                message,
+                dialect: client.dialect().as_str(),
+            }))
+        }
+        Err(error) => {
+            if let crate::decision::DecisionError::Http { status, body } = &error {
+                tracing::warn!(status, body, "decision endpoint test failed");
+            }
+            Ok(Json(DecisionTestResponse {
+                ok: false,
+                model: None,
+                sample_probability: None,
+                input_tokens: None,
+                message: error.safe_message(),
+                dialect: client.dialect().as_str(),
+            }))
+        }
+    }
 }
 
 async fn get_or_create(pool: &SqlitePool, owner_id: &str) -> Result<SettingsRow, ApiError> {
@@ -617,6 +787,23 @@ fn normalize_tavily_url(raw: Option<&str>) -> Result<String, ApiError> {
 
 fn normalize_media_base_url(raw: Option<&str>) -> Result<String, ApiError> {
     normalize_http_url(raw, DEFAULT_MEDIA_BASE_URL, "media_base_url")
+}
+
+/// The full decision URL, not a base: TypeSafe serves `/v1/systemone` and
+/// OpenRouter `/api/alpha/decisions`, so there is no path to append.
+fn normalize_decision_endpoint(raw: Option<&str>) -> Result<String, ApiError> {
+    normalize_http_url(raw, crate::decision::DEFAULT_ENDPOINT, "decision_endpoint")
+}
+
+fn normalize_min_confidence(raw: Option<f64>) -> Result<f64, ApiError> {
+    let value = raw.unwrap_or(crate::decision::DEFAULT_MIN_CONFIDENCE);
+    if value.is_finite() && (0.0..=1.0).contains(&value) {
+        Ok(value)
+    } else {
+        Err(ApiError::invalid_input(
+            "decision_min_confidence must be between 0 and 1",
+        ))
+    }
 }
 
 fn normalize_http_url(raw: Option<&str>, default: &str, field: &str) -> Result<String, ApiError> {

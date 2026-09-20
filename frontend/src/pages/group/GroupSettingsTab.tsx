@@ -15,10 +15,12 @@ import { Textarea } from '@/components/ui/textarea'
 import { useDeleteGroup } from '@/hooks/useDeleteGroup'
 import { useGroupAgents } from '@/hooks/useGroupAgents'
 import { useUpdateGroup } from '@/hooks/useGroups'
+import { useSystemSettings } from '@/hooks/useSystemSettings'
 import { useUnsavedChangesGuard } from '@/hooks/useUnsavedChangesGuard'
 import { useClearGroupMessages } from '@/hooks/useGroupMessages'
 import { ApiError } from '@/lib/api-v2/client'
 import { cn } from '@/lib/utils'
+import { GroupDecisionSettingsSection } from '@/pages/group/GroupDecisionSettingsSection'
 import { GroupSchedulerSettingsSection } from '@/pages/group/GroupSchedulerSettingsSection'
 import { logTerminalCleanupError } from '@/terminal/logTerminalCleanupError'
 import { useTerminalRuntime } from '@/terminal/TerminalRuntimeProvider'
@@ -91,6 +93,8 @@ export function GroupSettingsTab({ group, compact = false }: GroupSettingsTabPro
     group.default_speaking_order ?? null,
   )
   const communicationModeValue = communicationMode as string
+  const systemSettings = useSystemSettings()
+  const decisionEndpointConfigured = systemSettings.data?.decision_api_key_configured
 
   const [basicsError, setBasicsError] = useState<string | null | undefined>(undefined)
   const [commError, setCommError] = useState<string | null | undefined>(undefined)
@@ -472,6 +476,11 @@ export function GroupSettingsTab({ group, compact = false }: GroupSettingsTabPro
           <GroupSchedulerSettingsSection group={group} />
         </div>
       </details>
+
+      <GroupDecisionSettingsSection
+        group={group}
+        endpointConfigured={decisionEndpointConfigured}
+      />
 
       <GroupTemplatesSection group={group} />
 

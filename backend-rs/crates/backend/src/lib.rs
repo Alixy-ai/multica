@@ -2,6 +2,7 @@ pub mod acp;
 pub mod api;
 pub mod config;
 pub mod db;
+pub mod decision;
 pub mod docs;
 pub mod git;
 mod group_notes;

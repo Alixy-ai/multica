@@ -83,6 +83,7 @@ const schedulerSelectionReasonSchema = z.enum([
   'deterministic_order',
   'moderator',
   'moderator_fallback',
+  'decision_model',
 ])
 
 const groupTurnTerminationReasonSchema = z.enum([

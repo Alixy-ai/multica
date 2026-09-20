@@ -115,6 +115,16 @@ const group: GroupRead = {
   moderator_enabled: false,
   moderator_provider_id: null,
   moderator_model: null,
+  decision_enabled: false,
+  decision_scenarios: {
+    moderator_selection: false,
+    automatic_finish: false,
+    proactive_prefilter: false,
+    shell_risk: false,
+    skill_suggestion: false,
+    note_validation: false,
+    reply_outcome: false,
+  },
 }
 
 function renderSection(nextGroup: GroupRead = group) {
